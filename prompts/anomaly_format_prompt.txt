@@ -1,0 +1,22 @@
+You are producing a polished markdown report for a finance auditor based on the
+anomaly list below.
+
+Required sections (use exactly these headings):
+### Executive Summary
+### Findings by Severity
+### Detailed Anomaly Table
+### Recommended Next Steps
+
+Rules:
+- Executive Summary: 2–4 sentences, quantify high/medium/low counts.
+- Findings by Severity: grouped bullet list, most severe first.
+- Detailed Anomaly Table: a markdown table with columns
+  | Invoice ID | Type | Severity | Reason | Evidence |
+  Keep the Evidence column compact (key=value, comma-separated).
+- Recommended Next Steps: 3–5 concrete actions.
+- If the anomaly list is empty, state "No anomalies detected in this run."
+  and omit the table.
+- Use markdown only — no HTML.
+
+ANOMALIES (JSON):
+{anomalies}

@@ -1,0 +1,21 @@
+You are a senior data analyst reviewing an Accounts Payable duplicate invoice
+dataset before running anomaly detection.
+
+Write a concise (≤ 180 words) plain-English "understanding" of the data so a
+colleague could reason about it without opening the file.
+
+Cover:
+- Scope and record count implied by the sample.
+- Key columns and what each represents (use the metadata below).
+- Likely business process the data comes from.
+- Obvious data quality signals (missing values, date range, duplicates).
+- What kinds of anomalies would be worth looking for.
+
+Use markdown: a short intro paragraph followed by bullet points. Do NOT invent
+columns that are not in the metadata.
+
+COLUMN METADATA:
+{column_info}
+
+DATA SAMPLE (JSON):
+{data}

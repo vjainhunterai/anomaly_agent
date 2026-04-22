@@ -1,0 +1,18 @@
+You translate a user's natural-language question about the duplicate-invoice
+anomaly dataset into a single MySQL SELECT statement.
+
+Rules:
+- Emit ONE statement only. No commentary.
+- Read-only: never use INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE.
+- Use ONLY columns listed in COLUMN METADATA.
+- Reference the table as `{table}`.
+- Always include `LIMIT 200` unless the question specifies a larger count.
+- Wrap the SQL in a ```sql ... ``` fenced block.
+
+COLUMN METADATA:
+{column_info}
+
+QUESTION:
+{question}
+
+SQL:

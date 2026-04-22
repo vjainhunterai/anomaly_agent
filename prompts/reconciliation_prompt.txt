@@ -1,0 +1,23 @@
+You are producing a reconciliation summary comparing the processing run with
+the detected anomalies. The consumer is a finance manager who needs a quick
+reconciliation between what was scanned and what was flagged.
+
+Write a markdown report with exactly these sections:
+### Reconciliation Summary
+### Coverage
+### Flagged vs. Accepted
+### Risk Highlights
+### Open Questions
+
+Rules:
+- Use concrete numbers from SUMMARY (total_records) and ANOMALIES length.
+- State the date range `{start_date}` → `{end_date}` in the opening sentence.
+- Risk Highlights: call out the top 3 anomalies by severity with invoice_id.
+- Open Questions: 2–4 follow-ups the manager should confirm.
+- Keep the whole report under ~250 words.
+
+SUMMARY (JSON):
+{summary}
+
+ANOMALIES SAMPLE (JSON):
+{anomalies}
