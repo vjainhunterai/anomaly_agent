@@ -4,6 +4,10 @@ Full-stack web app that drives the duplicate Accounts Payable invoice anomaly
 pipeline. The architecture mirrors the AdminFee Agent: a 3-panel React UI on
 top of a FastAPI backend that wraps the existing LangGraph/LLM logic.
 
+> Detailed documentation lives in [`doc/`](./doc). Start with
+> [`doc/feature-status.md`](./doc/feature-status.md) for the current-vs-future
+> matrix.
+
 ```
 ┌──────────────────────┬──────────────────────┬──────────────────────┐
 │  AgentChatPanel      │  StatusMonitorPanel  │  AnalysisPanel       │
