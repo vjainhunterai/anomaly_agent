@@ -1957,5 +1957,272 @@ HTTP request (the response waits for SSH to return).
 
 ---
 
+## 14. Streaming & Real-Time Communication
+
+> **Section orientation.** The Anomaly Agent uses **HTTP polling**, not
+> streaming, on this branch. §14 is therefore largely **NA** today;
+> §14.5 has a partial analogue.
+
+### 14.1 Transport Choice — *NA (today) / Applicable (planned)*
+
+**In code today.** No SSE, no WebSocket, no HTTP/2 server push.
+
+- Status updates: `StatusMonitorPanel` polls `/api/status/summary` and
+  `/api/status/contracts` every 30 seconds (`POLL_MS = 30_000`).
+- Chat: request / response per turn (`POST /api/agent/chat`).
+- Analysis: blocking request (`POST /api/analysis/setup`) — the user
+  waits for understanding + chunked detection + format to finish.
+
+**Future.** Adopt **Server-Sent Events** for the status push and for
+streaming LLM tokens. SSE is preferred over WebSockets for this
+workload because:
+
+- Reads are one-way (server → client); no duplex needed.
+- SSE works through corporate proxies that block WS upgrades.
+- It maps cleanly onto the existing `/api/*` HTTP surface.
+
+PLANNED — see roadmap Phase 3.
+
+### 14.2 Token Streaming Protocol — *NA*
+
+**Why NA.** `invoke_llm` calls `.invoke(prompt)` which is the blocking
+LangChain method. There is no `.stream()` call on this branch and no
+SSE channel to deliver tokens over.
+
+**Future conditions for becoming Applicable.**
+
+- Add a `stream_llm(prompt)` async generator beside `invoke_llm`.
+  Wire it to a new `GET /api/agent/chat/stream` SSE endpoint that
+  emits `data:` events with partial content. PLANNED.
+- Frontend incremental render: append the partial text into the
+  current `chat-msg` and flush each animation frame. PLANNED — §14.5.
+
+### 14.3 Tool Call Streaming — *NA*
+
+**Why NA.** No function calling today (§7.1). The closest analogue is
+the SQL-then-rows reveal in the analyst panel: `analysis_ask` returns
+the answer, the SQL, and the rows in a single response, and the
+`<details>` element renders them on click — not progressively as they
+become available.
+
+**Future.** Once §7.1 future + §14.2 land, emit a `tool_call_start /
+tool_result` event pair per tool invocation. PLANNED.
+
+### 14.4 Reconnection & Resume — *NA*
+
+**Why NA.** No long-lived connection exists today, so there is nothing
+to reconnect or resume. Each panel's polling tick is independent — a
+dropped network call simply waits 30 s and tries again.
+
+**Future.**
+
+- SSE auto-reconnect via `EventSource` (browser-native). PLANNED.
+- Server-side `Last-Event-ID` checkpoints so a reconnecting client
+  resumes from the last token / status update. PLANNED.
+
+### 14.5 Client Buffering & Render Cadence — *Partial*
+
+**In code today.** Because there is no streaming, the cadence is
+binary: a panel either has data or it shows a "loading" state.
+
+- The chat panel renders a 3-dot `.typing` animation while `busy=true`
+  in `AgentChatPanel.jsx`.
+- The analysis panel shows `Generating…` while `reconBusy=true` in
+  `AnalysisPanel.jsx`.
+- The status panel does not show a spinner during refresh; it just
+  re-renders when the next tick lands.
+- The markdown renderer is fast enough on the full response that
+  there is no perceptible delay between `setMessages` and paint.
+
+**Future.**
+
+- For SSE token streaming, smooth the render cadence to one append
+  per animation frame (`requestAnimationFrame`) so the text does not
+  jitter. PLANNED.
+- Skeleton loaders for the analysis sections. PLANNED.
+
+---
+
+## 15. Full-Stack Integration Patterns
+
+### 15.1 API Layer — *Applicable*
+
+**In code today.** REST under `/api/*`, JSON in / JSON out, served by
+FastAPI. There is **no** BFF, no GraphQL, no tRPC. The frontend
+`services/api.js` is a thin `fetch` wrapper that calls these routes
+directly through the Vite proxy (§3.1).
+
+| Group | Routes | Purpose |
+|-------|--------|---------|
+| Agent | `/api/agent/start`, `/api/agent/chat` | FSM driver |
+| Status | `/api/status/summary`, `/api/status/contracts`, `/api/status/ask` | Centre panel |
+| Analysis | `/api/analysis/deliveries`, `/api/analysis/setup`, `/api/analysis/ask` | Right panel |
+| Reports | `/api/reports/reconciliation`, `/api/reports/audit` | Reconciliation + audit |
+| Health | `/api/health` | Liveness + DB check |
+
+Full request / response detail: `doc/api-reference.md`.
+
+**Future.**
+
+- An optional GraphQL layer if the analyst panel needs to compose
+  several routes' data into one render. Not justified today. PLANNED
+  if the UI grows.
+
+### 15.2 Type Safety Across Stack — *Partial*
+
+**In code today.**
+
+- **Backend.** Pydantic 2 models on every request / response — strong
+  typing inside Python.
+- **Frontend.** Plain JavaScript; no TypeScript, no JSDoc. The
+  frontend reads the response shape by convention.
+- **No codegen.** `/openapi.json` is published but not consumed.
+- **No contract test.** Nothing fails the build if the backend
+  changes a field name.
+
+**Future.**
+
+- Adopt TypeScript on the frontend. PLANNED.
+- Codegen TypeScript types from `/openapi.json` into
+  `frontend/src/types/`. PLANNED.
+- Schemathesis contract test in CI. PLANNED — §20.
+
+### 15.3 File Upload & Asset Pipeline — *NA*
+
+**Why NA.** There is no file upload UI, no presigned-URL flow, no
+virus scan, no asset pipeline. The frontend never sends multipart
+form data; the backend pins `python-multipart` only because FastAPI
+imports it transitively.
+
+**Future.** PLANNED — §12.4 future (CSV / Excel uploads).
+
+### 15.4 Feature Flags & Remote Config — *NA*
+
+**Why NA.** No feature flag provider (LaunchDarkly, GrowthBook,
+custom). All toggles today are env vars (`OPENAI_MODEL`,
+`OPENAI_TEMPERATURE`, `API_PORT`, etc.) read once at startup.
+
+**Future.**
+
+- A small flag layer for prompt A/B testing (§6.4 future) and for
+  rolling out streaming (§14). PLANNED.
+
+### 15.5 Third-Party Integrations — *Applicable*
+
+**In code today.**
+
+| Integration | How it is wired |
+|-------------|-----------------|
+| OpenAI | `langchain-openai.ChatOpenAI` constructed in `get_llm`. Auth via `OPENAI_API_KEY` (`backend/config.py`). |
+| Airflow on EC2 | SSH command via Paramiko (`backend/airflow_trigger.py`). Auth via key file at `SSH_KEY_PATH`. |
+| AWS RDS / MySQL | SQLAlchemy + PyMySQL connection string in `DB_URI` (`backend/config.py`). |
+| AWS S3 | not used today; `boto3` is pinned for future ingestion. |
+
+There are no OAuth providers, no SaaS connectors, no inbound
+webhooks.
+
+**Future.**
+
+- Outbound webhook to a chat tool (Slack / Teams) on completion.
+  PLANNED — §1.2.
+- Inbound webhook from Airflow on DAG success / failure (replaces
+  the polling loop). PLANNED — §3.1 future + roadmap Phase 2.
+
+---
+
+## 16. Authentication, Authorization & Sessions
+
+> **Section orientation.** The Anomaly Agent has **no authentication
+> and no authorization** on this branch. §16 is largely **NA** today.
+> §16.3 (session management) and §16.5 (audit logging) have partial
+> in-code analogues.
+
+### 16.1 Identity Providers — *NA*
+
+**Why NA.** No SSO, no OAuth, no magic-link, no SAML, no OIDC. The
+frontend never asks the user who they are; the backend never reads
+an `Authorization` header. The header is the operator's role,
+implicitly.
+
+**Future.** OIDC against the corporate IdP (Azure AD or Google).
+PLANNED — roadmap Phase 5.
+
+### 16.2 Authorization Model — *NA*
+
+**Why NA.** No RBAC, no ABAC, no per-resource permissions. Every
+session can call every endpoint; the only access control is **CORS**
+(`localhost:3000` only) and **read-only SQL** (`run_select_safely`).
+
+**Future.**
+
+- Two roles to start: `analyst` (read + analysis Q&A) and `admin`
+  (trigger pipeline + view audit). PLANNED — roadmap Phase 5.
+- Per-tenant isolation column on every persisted record. PLANNED.
+
+### 16.3 Session Management — *Applicable*
+
+**In code today.**
+
+- **Session id.** UUID4 string, generated by `SessionStore.create()`.
+  Returned by `/api/agent/start`; the frontend stores it in component
+  state and includes it in every subsequent request body. **It is not
+  a cookie, not an HTTP-only token, and not bound to a device.**
+- **Lifetime.** Bounded by the FastAPI process. There is no idle TTL
+  and no explicit revocation.
+- **Concurrency.** `SessionStore` is guarded by a `threading.Lock`.
+- **Reset.** *New Session* button creates a fresh `Session`; the old
+  one is abandoned but not deleted (§11.5).
+
+**Future.**
+
+- HTTP-only cookies for the session token. PLANNED.
+- Idle TTL + sliding window on persisted sessions. PLANNED — §8.4.
+- Explicit revocation endpoint. PLANNED — §11.5.
+
+### 16.4 API Keys & Service Accounts — *NA*
+
+**Why NA.** No programmatic access surface today. Every route is
+designed for a human-in-the-loop session — there is no service
+account, no API key, no token rotation policy.
+
+**Future.**
+
+- API key for the `/api/reports/*` routes if a downstream BI tool
+  needs to ingest the audit log. PLANNED.
+
+### 16.5 Audit Logging — *Applicable*
+
+**In code today.**
+
+- Every chat turn, FSM transition, metadata write, Airflow trigger,
+  analysis setup, and reconciliation logs an audit event via
+  `Session.log(event, detail)` — see `backend/main.py`.
+- `SessionStore.all_audit()` aggregates events across all sessions in
+  the process and exposes them at `GET /api/reports/audit`,
+  newest-first.
+
+| Event | Detail payload |
+|-------|----------------|
+| `session_start` | (none) |
+| `dates_parsed` | `{start_date, end_date}` |
+| `metadata_written` | `{start, end}` |
+| `airflow_trigger` | `{ok, run_id, stderr}` |
+| `analysis_setup` | `{delivery_id}` |
+| `analysis_ready` | `{anomaly_count}` |
+| `analysis_ask` | `{question, sql}` |
+| `reconciliation` | `{anomaly_count}` |
+
+The log is **in-memory only** today (§8.4) and **un-authenticated**
+(any caller of `/api/reports/audit` sees every session's events).
+
+**Future.**
+
+- Persist audit events to a dedicated `audit_events` table. PLANNED —
+  roadmap Phase 1.
+- Lock `/api/reports/audit` behind an `admin` role. PLANNED — §16.2.
+- Tamper-evident audit (hash chain or immutable storage). PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-14 and beyond will be added in subsequent commits.*
+17 and beyond will be added in subsequent commits.*
