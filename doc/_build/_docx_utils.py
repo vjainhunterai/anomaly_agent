@@ -28,6 +28,7 @@ STATUS_COLORS = {
     "PARTIAL":     RGBColor(0xB7, 0x6E, 0x00),
     "PLANNED":     RGBColor(0x8C, 0x1A, 0x1A),
     "NOT USED":    RGBColor(0x55, 0x55, 0x55),
+    "NA":          RGBColor(0x70, 0x70, 0x70),
 }
 
 
@@ -70,7 +71,11 @@ class LLDBuilder:
             "persistence). "
         )
         legend.add_run(
-            "PLANNED = not in code today; documented for direction."
+            "PLANNED = not in code today; documented for direction. "
+        )
+        legend.add_run(
+            "NA = the LLD template asks for something that does not apply to the "
+            "Anomaly Agent (e.g. multi-agent coordination, RAG)."
         )
 
         self.doc.add_paragraph()  # spacer
