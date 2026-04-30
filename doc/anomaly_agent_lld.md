@@ -2466,5 +2466,217 @@ post-incident artefact.
 
 ---
 
+# Part VI — Quality & Operations
+
+## 19. UX & Interaction Design
+
+### 19.1 Onboarding — *Applicable*
+
+**In code today.**
+
+- A first-time user lands on `http://localhost:3000` and sees three
+  panels populated with explanatory empty states.
+- The chat panel calls `/api/agent/start` on mount and renders the
+  greeting (`backend/main.py::GREETING`) in markdown — that is the
+  onboarding copy. The greeting tells the user (a) what the app does,
+  (b) what shape of input is expected (`2024-12-25 to 2025-12-25`),
+  and (c) how to quit.
+- The status panel renders a *"No records yet. Trigger a run to see
+  data here."* empty state until data arrives
+  (`StatusMonitorPanel.jsx::ContractsTable`).
+- The analysis panel renders a *"Trigger a pipeline run from the chat
+  panel, or pick an existing delivery above and click Run analysis."*
+  empty state (`AnalysisPanel.jsx`).
+
+There is **no separate onboarding tour**, no walkthrough overlay, and
+no sample-prompt picker.
+
+**Future.**
+
+- A first-run tour using a tiny home-rolled tooltip primitive (no
+  dependency on a library). PLANNED.
+- Sample prompts surfaced in the chat panel's empty state. PLANNED.
+
+### 19.2 Progressive Disclosure — *Applicable*
+
+**In code today.** The 3-panel layout *is* progressive disclosure:
+
+1. The chat panel is always visible — the first thing the user reads.
+2. The status panel populates only after a run is triggered; until
+   then it renders the empty state.
+3. The analysis panel populates only after the run completes (or the
+   user manually picks a delivery).
+
+Inside the chat panel: quick-reply buttons (`Confirm & run`, `Cancel`)
+appear **only** on `step=confirm` (`AgentChatPanel.jsx`). The user is
+not shown options that don't apply.
+
+Inside the analysis panel: the SQL view is hidden behind a
+`<details>` summary (`Generated SQL`); the auditor sees the
+natural-language answer first.
+
+**Future.**
+
+- Collapse / expand the analysis sections (Understanding, Report,
+  Anomalies, Q&A) so a long page does not overwhelm. PLANNED.
+
+### 19.3 Error & Empty States — *Applicable*
+
+**In code today.**
+
+| Surface | State | Treatment |
+|---------|-------|-----------|
+| Health badge | `db: down` | Header chip flips amber: *"backend: ok/down"* (`App.jsx::HealthBadge`). |
+| Chat panel | API error | Adds a `⚠️ <message>` assistant turn; clears `busy`. |
+| Status panel | Fetch fails | Renders a `.panel-error` block with the error text; polling continues. |
+| Status panel | No contracts | Renders the *"No records yet"* empty state. |
+| Analysis panel | Setup fails | Renders the `.panel-error` block. |
+| Analysis panel | No delivery selected | Renders the picker prompt. |
+| Reconciliation | LLM fails | The deterministic fallback renders a static markdown summary; never blank. |
+
+Tone of these messages: *what went wrong + what to do next* (e.g.
+*"Fix the SSH / DAG configuration and reply `retry`"*). No emoji
+besides ✅/⚠️/❌; no exclamation marks.
+
+**Future.**
+
+- Centralised toast layer for transient errors so a panel that has
+  data does not lose it on the next failed refresh. PLANNED.
+- Inline "report this" link on every error state. PLANNED — §19.4.
+
+### 19.4 Feedback Mechanisms — *NA*
+
+**Why NA.** There are no thumbs-up/down buttons, no inline rating, no
+"report this" link, no email-the-team form. The audit log (§16.5)
+captures *what the agent did* but not *whether the auditor agreed
+with it*.
+
+**Future.**
+
+- Per-anomaly thumbs-up / thumbs-down. PLANNED — bedrock for §5.4
+  fine-tuning and §20.2 evaluation.
+- Inline free-text feedback on assistant responses. PLANNED.
+- Escalation link for high-severity flags ("send to AP supervisor").
+  PLANNED.
+
+### 19.5 Latency Perception — *Applicable*
+
+**In code today.**
+
+- **Typing indicator.** Three-dot animation in the chat panel while
+  `busy=true` (`AgentChatPanel.jsx::typing`).
+- **Generating note.** *"Generating…"* text under the reconciliation
+  section while `reconBusy=true` (`AnalysisPanel.jsx`).
+- **Last-updated timestamp.** Status panel shows
+  *"updated HH:MM:SS"* in muted text so the user knows the page is
+  alive (`StatusMonitorPanel.jsx`).
+- **Disabled buttons.** Send / Confirm / Refresh disable while a
+  request is in flight; this gates double-submits.
+- **Optimistic UI.** The user's typed message is appended to the
+  chat log *before* the response arrives — the user sees their own
+  turn instantly.
+
+What is **not** done today:
+
+- No skeleton loaders for the analysis sections (just text placeholders).
+- No streaming render (§14.2).
+- No progressive reveal of long markdown reports.
+
+**Future.**
+
+- Skeleton loaders + token streaming once §14.2 lands. PLANNED.
+
+---
+
+## 20. Testing Strategy
+
+> **Section orientation.** There are **no automated tests** on this
+> branch. Every subsection of §20 is **NA today / PLANNED**. The
+> roadmap (Phase 8 in `doc/roadmap.md`) has the test plan in detail.
+
+### 20.1 Test Pyramid — *NA today*
+
+**Why NA.** No `pytest`, no `vitest`, no Playwright on this branch.
+No coverage target, no CI gate. Code is verified by manual run-through
+of the smoke test in `doc/setup-windows.md`.
+
+**Future.**
+
+| Layer | Tooling | Targets |
+|-------|---------|---------|
+| Backend unit | `pytest` | FSM transitions, `validate_date_range`, `_normalize_with_regex`, `run_select_safely` (every accept / reject branch). |
+| Backend integration | `pytest` + sqlite or test MySQL | DB helpers + `analysis_setup` happy path with mocked LLM. |
+| Frontend unit | `vitest` + `@testing-library/react` | `MarkdownRenderer` (HTML escape, table parse), `StatusMonitorPanel` ref-gating logic (the most subtle piece). |
+| End-to-end | `Playwright` | One scenario: type date → confirm → status flips to complete → analysis populates. |
+
+PLANNED — roadmap Phase 8.
+
+### 20.2 LLM Evaluation Suites — *NA today*
+
+**Why NA.** No golden set, no rubric, no LLM-as-judge harness, no
+human review queue. The required-headings contract in two prompts
+(§2.2) is the only structural check, and even that is not enforced
+at runtime.
+
+**Future.**
+
+- A `tests/eval/fixtures/` directory with `(input, expected)` pairs
+  per logical role in §4.1.
+- A nightly harness that:
+  1. Replays each fixture against the live LLM.
+  2. Scores each response with an LLM-as-judge using the rubric in
+     the corresponding prompt's required-headings / sentence-count
+     constraints.
+  3. Diff-checks against goldens for regression.
+- A small human-review UI that surfaces the ten most-disagreed-with
+  responses each week. PLANNED.
+
+### 20.3 Regression Testing — *NA today*
+
+**Why NA.** No snapshot tests, no behaviour freeze on critical paths
+(e.g. *"the SQL guard NEVER lets DELETE through"* is not encoded as a
+test).
+
+**Future.**
+
+- Snapshot test on the `format_report` output for a stable anomaly
+  fixture. PLANNED.
+- A safety-property test that asserts `run_select_safely` rejects
+  every member of a curated destructive-SQL list. PLANNED — §17.4.
+- Behaviour freeze: any change to the FSM transition table must
+  update a snapshot test. PLANNED.
+
+### 20.4 Load & Stress Testing — *NA today*
+
+**Why NA.** No load test, no concurrency target, no chaos scenario.
+The MVP is one operator on one laptop.
+
+**Future.**
+
+- Concurrency target: 10 concurrent sessions on a single uvicorn
+  worker (after §13.4 future). PLANNED.
+- Burst profile for `/api/analysis/setup`: rate-limit at 1/min/user
+  to protect the OpenAI quota. PLANNED — §23.3.
+- Chaos: kill the SSH host mid-trigger and assert the FSM reaches
+  `STEP_ERROR` cleanly. PLANNED.
+
+### 20.5 Pre-Release Gates — *NA today*
+
+**Why NA.** No CI; no required green checks before merge. The
+operator runs the smoke test by hand.
+
+**Future.** GitHub Actions workflow that gates merges on:
+
+1. Lint (`ruff`) — backend.
+2. Type-check (`pyright`) — backend, once typing is tightened.
+3. Lint (`eslint`) — frontend.
+4. Unit + integration tests (§20.1).
+5. LLM eval threshold (§20.2).
+6. Schemathesis contract test (§15.2).
+
+PLANNED — roadmap Phase 6.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-19 and beyond will be added in subsequent commits.*
+21 and beyond will be added in subsequent commits.*
