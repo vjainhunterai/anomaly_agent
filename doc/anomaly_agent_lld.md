@@ -1712,5 +1712,250 @@ literal string `"[]"` (§8.3).
 
 ---
 
+# Part IV — Frontend & Backend
+
+## 12. Frontend Architecture
+
+### 12.1 Framework & Rendering Strategy — *Applicable*
+
+**In code today.**
+
+| Decision | Value | Where |
+|----------|-------|-------|
+| Framework | React 18.3 | `frontend/package.json` |
+| Bundler / dev server | Vite 5.4 | `frontend/vite.config.js` |
+| Rendering | CSR (client-side only); no SSR | `frontend/src/main.jsx` mounts into `#root` |
+| Routing | none (single-page, three panels) | `frontend/src/App.jsx` |
+| State management | local `useState` + props | no Redux / Zustand / Context store |
+| Language | plain JavaScript (no TypeScript) | `.jsx` extension throughout |
+| Styling | plain CSS via `:root` variables | `frontend/src/index.css` |
+| Dev port / proxy | `:3000` strictPort, `/api` → `:8000` | `frontend/vite.config.js` |
+
+Shared frontend state lives in `App.jsx`: `sessionId`, `activeDelivery`,
+`activeContracts`, `processingComplete`, `health`, `resetKey`. Every
+other piece of state is local to a panel.
+
+**Future.**
+
+- Adopt TypeScript. Codegen the request / response types from
+  `/openapi.json` into `frontend/src/types/`. PLANNED — §15.2.
+- Add a route per delivery (e.g. `/run/<run_id>`) once persistence
+  lands. PLANNED — §11.3 future.
+
+### 12.2 Component Library — *Partial*
+
+**In code today.** No third-party UI library (no MUI, Chakra, Ant
+Design, shadcn). Every primitive is hand-rolled in CSS:
+
+| Primitive | Where |
+|-----------|-------|
+| Button (`.btn`, `.btn-primary`, `.btn-ghost`, `.btn-sm`) | `frontend/src/index.css` |
+| Status chip (`.step-chip`, `.badge`) | same |
+| Status card (`.status-card`, with tone variants) | same |
+| Grid table (`.grid-table`, sticky header) | same |
+| Markdown table (`.md-table-wrap`, `.md-table`) | same |
+| Pill (`.pill`) | same |
+| Empty / error / muted states | same |
+
+The "library" is therefore the CSS file plus the inline JSX. There is
+no Storybook, no design-tokens package shared across repos.
+
+**Future.**
+
+- Extract the primitives into a `frontend/src/components/ui/` folder
+  with one component per primitive. PLANNED.
+- Share design tokens with the AdminFee Agent via a small NPM
+  package. PLANNED — §2.4.
+
+### 12.3 Chat UI Patterns — *Applicable*
+
+**In code today.**
+
+- **Message rendering.** Each turn is a `.chat-msg` block with role
+  badge (`You` / `Agent`); assistant turns render through
+  `MarkdownRenderer.jsx`, user turns render verbatim with
+  `white-space: pre-wrap`.
+- **Markdown.** Custom renderer handles headings, bold/italic, inline
+  code, fenced code blocks (with `lang-<name>` class), ordered /
+  unordered lists, GitHub-style tables, links — see §2.2.
+- **Code blocks.** `.code-block` style with monospace font and slight
+  background tint.
+- **Tool traces.** Today only the SQL view in the analyst panel. The
+  generated SQL hides behind a `<details>` element (`Generated SQL`
+  summary); rows render in a `.qa-rows` grid table when the safe-SQL
+  guard accepts them.
+- **Citations.** Inline `code` spans for `invoice_id`, field names,
+  table names — driven entirely by the prompts (§2.2).
+- **Typing indicator.** Three dots animation in `AgentChatPanel.jsx`
+  while a request is in flight.
+- **Quick replies.** `Confirm & run` and `Cancel` buttons surface only
+  on `step=confirm` (`AgentChatPanel.jsx::quickReply`).
+
+**Future.**
+
+- Streaming render (token by token) once §14.2 lands. PLANNED.
+- Inline tool-trace blocks once §7.1 future lands. PLANNED.
+- Inline citation popovers (e.g. hover an `invoice_id` to see the
+  underlying row). PLANNED.
+
+### 12.4 Input Modalities — *Partial*
+
+**In code today.**
+
+- **Text only.** Each panel uses a `<textarea>` or `<input
+  type="text">` (chat panel uses textarea with Enter-to-send).
+- **No voice.** No `MediaRecorder`, no Web Speech API.
+- **No file upload.** No drag-and-drop, no `<input type="file">`.
+- **No image paste.** No clipboard handlers.
+
+**Future.**
+
+- File upload of an off-line CSV or Excel of suspect invoices for
+  ad-hoc analysis. PLANNED — §15.3.
+- Voice input in the analyst panel for hands-free Q&A. PLANNED.
+
+### 12.5 Accessibility — *Partial*
+
+**In code today.**
+
+- Semantic HTML: `<header>`, `<main>`, `<section>`, `<footer>`,
+  proper heading hierarchy.
+- Buttons are real `<button>` elements (not div-buttons), so keyboard
+  focus and Space/Enter activation work for free.
+- Forms use real `<select>`, `<textarea>`, `<input>` elements; Enter
+  submits the chat textarea (with `Shift+Enter` for newline).
+- Colour-only signals are paired with text labels (the status chip
+  shows the state name, not just the colour).
+
+What is **not** done today:
+
+- No WCAG audit, no automated `axe-core` run.
+- No explicit `aria-label` on the icon-only brand-dot or step chips.
+- No focus ring polish in CSS (relies on browser default).
+- No reduced-motion media query.
+- No keyboard shortcut for "New Session" or "Refresh".
+
+**Future.**
+
+- WCAG 2.1 AA target: add `aria-label`s, focus rings, reduced-motion
+  fallback for the typing indicator. PLANNED.
+- Keyboard shortcut layer (`?` opens a help overlay). PLANNED.
+
+---
+
+## 13. Backend Services
+
+### 13.1 Service Boundaries — *Applicable*
+
+**In code today.** Single FastAPI service. There is no gateway, no
+orchestrator microservice, no agent-runtime/tool-registry split. The
+modules inside the service are organised by responsibility (see §3.2)
+but they all run in the same Python process and share the same
+`SessionStore` instance.
+
+| Logical responsibility | Module |
+|------------------------|--------|
+| HTTP edge (gateway-equivalent) | `backend/main.py` (CORS + route handlers) |
+| Orchestrator (FSM dispatcher) | `_handle_*` helpers in `backend/main.py` |
+| Agent runtime (LLM calls + fallbacks) | `backend/llm_service.py` |
+| Tool registry (DB + Airflow) | `backend/database.py`, `backend/airflow_trigger.py` |
+| Session storage | `backend/session_manager.py` |
+| Configuration | `backend/config.py` |
+
+**Future.**
+
+- Split out the agent runtime if §7.1 future lands and the function-
+  calling loop becomes long-running enough to warrant its own process
+  (with shared queue / state). PLANNED.
+- Extract the SSH trigger into a sidecar so the FastAPI process never
+  blocks on Paramiko. PLANNED — §13.5.
+
+### 13.2 Inter-Service Communication — *Partial*
+
+**In code today.** Inside the single FastAPI process: plain function
+calls. Across process boundaries:
+
+| External call | Transport |
+|---------------|-----------|
+| FastAPI ↔ MySQL | TCP/3306 via PyMySQL (sync, blocking). |
+| FastAPI ↔ Airflow EC2 host | SSH/22 via Paramiko (sync, blocking). |
+| FastAPI ↔ OpenAI | HTTPS via LangChain-OpenAI → `openai` SDK (sync, blocking). |
+| Browser ↔ FastAPI | HTTP/JSON via `fetch` (CORS-allow-list-gated). |
+
+There is no asynchronous queue, no pub/sub, no gRPC. All blocking; on
+the FastAPI side, each blocking call holds an event-loop thread until
+it returns.
+
+**Future.**
+
+- Move SSH triggering to a background task with a queue (Celery /
+  RQ). PLANNED — §13.5.
+- Add retry / jitter wrapper around the OpenAI call. PLANNED — §26.5.
+
+### 13.3 Data Contracts — *Applicable*
+
+**In code today.** Pydantic 2 models in `backend/main.py` define the
+shape of every request and response. The same Pydantic models drive
+the auto-generated `/openapi.json` and the Swagger UI at `/docs`.
+
+Examples:
+
+```python
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+class StatusSummary(BaseModel):
+    total_records: int
+    anomalies_detected: int
+    processing_state: str
+    start_date: str | None = None
+    end_date: str | None = None
+    last_updated: str
+```
+
+The frontend `services/api.js` does not import these schemas — it
+manually constructs the request bodies and trusts the response shape.
+
+**Future.**
+
+- Codegen TypeScript types from `/openapi.json` into the frontend.
+  PLANNED — §15.2.
+- Versioned contracts via the `Accept` header (e.g.
+  `application/vnd.anomaly.v1+json`). PLANNED — §23.2.
+- Contract tests (Schemathesis) in CI. PLANNED — §20.
+
+### 13.4 Service Scaling — *NA*
+
+**Why NA.** The service is intentionally single-process / single-worker
+on this branch (uvicorn `--reload` implies one worker). No horizontal
+scaling, no hot-path isolation, no statelessness work has been done
+because the in-memory `SessionStore` cannot span workers (§4.5).
+
+**Future conditions for this subsection becoming Applicable.**
+
+- A persistent session store lands (§8 future + roadmap Phase 1). At
+  that point uvicorn / gunicorn workers can be scaled horizontally.
+- Hot-path isolation: dedicate one worker pool to the chat / status
+  routes (low latency) and another to `/api/analysis/setup` (long
+  blocking calls). PLANNED.
+
+### 13.5 Background Jobs — *NA*
+
+**Why NA.** There is no scheduler, no Celery / RQ / APScheduler, no
+DLQ, no idempotency token. The Airflow trigger is the closest thing
+to a background job, and even that is invoked synchronously inside an
+HTTP request (the response waits for SSH to return).
+
+**Future conditions for this subsection becoming Applicable.**
+
+- Move `_trigger_pipeline` to a background task with a queue so the
+  user gets an immediate "queued" reply and the status panel watches
+  for completion. PLANNED — §3.1 future + roadmap Phase 2.
+- Schedule a nightly `analysis_setup` for the previous day so the
+  morning auditor finds a pre-computed report. PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-12 and beyond will be added in subsequent commits.*
+14 and beyond will be added in subsequent commits.*
