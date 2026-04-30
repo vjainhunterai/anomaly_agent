@@ -2678,5 +2678,206 @@ PLANNED — roadmap Phase 6.
 
 ---
 
+## 21. Observability & Monitoring
+
+### 21.1 Telemetry Stack — *Partial*
+
+**In code today.** The only telemetry layer is Python's standard
+`logging` module:
+
+```python
+# backend/main.py
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s",
+)
+log = logging.getLogger("anomaly_agent")
+```
+
+Every module has a module-level `log = logging.getLogger(__name__)`.
+What gets logged:
+
+- Each route logs INFO on entry / WARN on graceful failure (e.g. DB
+  unreachable in `database.fetch_anomaly_summary`).
+- LLM call exceptions log at ERROR via `log.exception(...)` in
+  `llm_service.invoke_llm`.
+- DB pool defaults are quiet (`echo=False`).
+
+What is **not** in the telemetry stack today:
+
+- No metrics (Prometheus / OpenTelemetry / vendor SDK).
+- No distributed traces (OTel context propagation across browser →
+  FastAPI → MySQL / Airflow / OpenAI).
+- No structured JSON logs.
+- No log retention policy; the operator's terminal scrollback is the
+  log store.
+
+**Future.**
+
+- Structured JSON logs to stdout via `python-json-logger`. PLANNED.
+- OpenTelemetry SDK with OTLP exporter (Honeycomb / Datadog / Tempo).
+  PLANNED — roadmap Phase 6.
+- Sampling: 100% errors, 5% successes. PLANNED.
+
+### 21.2 LLM-Specific Observability — *NA*
+
+**Why NA.** No prompt / response capture, no token-count counter, no
+tool-trace recording, no eval-score telemetry. `invoke_llm` does not
+log the prompt or the response — only the exception when one occurs.
+
+**Future.**
+
+- Capture every LLM call as `{prompt_hash, role, latency_ms,
+  prompt_tokens, completion_tokens, model, status}`. PLANNED — feeds
+  §22.1 cost model.
+- Anonymous payload (truncated, redacted) for failed parses, so a
+  parse-rate regression is debuggable. PLANNED.
+- Per-prompt-version metrics once §6.4 future lands. PLANNED.
+
+### 21.3 Dashboards — *NA*
+
+**Why NA.** No Grafana, no Datadog dashboards, no in-app metrics page.
+The audit endpoint (`/api/reports/audit`) is the closest thing to a
+dashboard surface, and it is JSON only.
+
+**Future.**
+
+- Three dashboards (in priority order):
+  1. **Operational.** Backend p50/p95/p99 latency by route; error
+     rate; DB connection failures.
+  2. **LLM quality.** Parse rate per JSON-emitting prompt; eval score
+     trend (after §20.2).
+  3. **Business.** Runs per day, anomalies per run, auditor accept
+     rate (after §19.4).
+
+PLANNED.
+
+### 21.4 Alerting — *NA*
+
+**Why NA.** No alert rules, no PagerDuty / Opsgenie / Slack hook, no
+on-call rotation. A health failure today is silent unless the operator
+notices the amber chip.
+
+**Future.**
+
+- SLO-based alerts (see §26.1 future).
+- Synthetic monitor on `/api/health` from outside the box. PLANNED —
+  roadmap Phase 6.
+
+### 21.5 Debugging Workflows — *Partial*
+
+**In code today.**
+
+- **Audit endpoint.** `GET /api/reports/audit` exposes every
+  `Session.log` event across the process; useful for "what did the
+  agent do in the last hour?" until the process restarts (§16.5).
+- **uvicorn `--reload`.** Backend hot-restarts on any file change in
+  `backend/` or `prompts/` so a developer sees the effect of a fix
+  immediately.
+- **FastAPI `/docs`.** Live Swagger UI lets a developer call any
+  route by hand without writing a curl command.
+- **Frontend dev mode.** Vite Fast Refresh; React strict mode in
+  `frontend/src/main.jsx` flags double-invocations.
+
+What is **not** done today:
+
+- No conversation replay tool ("re-run this session id with model X").
+- No shadow-run mode (run a candidate prompt against live traffic
+  without surfacing).
+
+**Future.**
+
+- Session replay endpoint that re-emits the user turns through the
+  current FSM. PLANNED — §11.3 future.
+- Shadow runs gated by a feature flag. PLANNED — §15.4 future.
+
+---
+
+## 22. Cost Management & Optimization
+
+> **Section orientation.** No cost telemetry exists on this branch
+> (§21.2). Most of §22 is therefore **NA today**, with the exception
+> of §22.3 where one form of caching is already used.
+
+### 22.1 Cost Model — *NA today*
+
+**Why NA.** No per-request, per-user, or per-tenant cost tracking. We
+know the model is `gpt-4.1-mini` and the temperature is 0; we do not
+know how many tokens an average run consumes or how much it costs.
+
+**Future.**
+
+- Model the cost as: `(input_tokens × in_rate) + (output_tokens ×
+  out_rate)` per call, summed by `role` and by `session_id`. Surface
+  the per-session cost in `Session.audit`. PLANNED.
+- Per-tenant aggregation once §16 future lands. PLANNED.
+
+### 22.2 Token Budgets — *NA today*
+
+**Why NA.** No input cap, no output cap, no per-user-tier limit. The
+sampling caps (200 rows for understanding / detection, 50 rows for
+status Q&A) are *fixed values*, not budgets — they don't shrink under
+pressure.
+
+**Future.**
+
+- Soft cap: warn the operator if a single `analysis_setup` call would
+  exceed N tokens. Hard cap: refuse and ask the user to narrow the
+  date range. PLANNED.
+- Per-user-tier limits (§16.2 future) for any future SaaS deployment.
+  PLANNED.
+- Dynamic truncation of `{anomalies}` and `{rows}` payloads, ranked
+  by severity / recency. PLANNED — §11.2 future.
+
+### 22.3 Caching Strategies — *Partial*
+
+**In code today.**
+
+| Cache | Where |
+|-------|-------|
+| Prompt file cache | `_prompt_cache: dict[str, str]` in `backend/llm_service.py::load_prompt` — files are read once and held in process memory. |
+| Analysis cache | `Session.analysis` holds the rows / understanding / anomalies / final_output for a session, so `/api/analysis/ask` and `/api/reports/reconciliation` reuse them without re-running the LLM pipeline. |
+
+What is **not** cached:
+
+- LLM responses themselves are not cached. Two sessions hitting the
+  same prompt with the same `{column_info}` and `{data}` will pay the
+  full token cost both times.
+- No CDN; assets are served by Vite's dev server.
+- No semantic cache (similar-question short-circuit).
+
+**Future.**
+
+- Anthropic prompt caching (when §5.3 future lands a Claude path) —
+  the long `{column_info}` block is a textbook cache target. PLANNED.
+- A small in-process LRU on `(prompt_name, hash(filled_prompt)) →
+  response` for short windows. PLANNED.
+- Embedding-based semantic cache for analyst Q&A. PLANNED — depends
+  on §9.1.
+
+### 22.4 Model Cascading — *NA*
+
+**Why NA.** Only one model is configured (§5.1). There is no
+"cheap-first, escalate on low confidence" rule.
+
+**Future conditions for becoming Applicable.** A second model lands
+in §5.1 and a confidence signal (`severity` is *not* confidence) is
+added by §17.4. PLANNED.
+
+### 22.5 Cost Alerts & Attribution — *NA*
+
+**Why NA.** No cost data → no alerts, no attribution. Today the only
+indicator that the LLM bill is unusually high is the OpenAI dashboard
+itself.
+
+**Future.**
+
+- Daily cost rollup written to a `cost_events` table; alert if the
+  day-over-day change exceeds a threshold. PLANNED.
+- Per-feature attribution (chat / analysis / reconciliation /
+  status). PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-21 and beyond will be added in subsequent commits.*
+23 and beyond will be added in subsequent commits.*
