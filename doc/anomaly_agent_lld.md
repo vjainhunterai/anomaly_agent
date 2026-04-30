@@ -2224,5 +2224,247 @@ The log is **in-memory only** today (§8.4) and **un-authenticated**
 
 ---
 
+# Part V — Safety & Security
+
+## 17. Guardrails & Alignment
+
+### 17.1 Policy Layer — *NA*
+
+**Why NA.** There is no policy classifier, no allowed/disallowed topic
+list, and no escalation policy on this branch. The Anomaly Agent's
+"policy" is implicit in the prompts: each role tells the model what to
+output and what to refuse, but there is no separate guardrail layer
+that inspects either the prompt or the response.
+
+This is acceptable today because:
+
+- The agent is single-tenant, internal, behind localhost CORS.
+- The prompts only ever execute against a known, structured table
+  (`anomaly.duplicate_ap_invoice`).
+- The only side effects are `upsert_anomaly_metadata` (idempotent) and
+  the SSH trigger (gated by `STEP_CONFIRM`).
+
+**Future.**
+
+- A pre-LLM policy layer that checks the user's free-text input for
+  obviously off-task content (e.g. "ignore previous instructions").
+  PLANNED.
+- A post-LLM policy layer that validates the output against the
+  required-headings contract before render. PLANNED — §2.2 future.
+- An explicit escalation rule for high-severity anomaly volumes.
+  PLANNED — §1.2.
+
+### 17.2 Input Filtering — *Partial*
+
+**In code today.**
+
+| Filter | Where |
+|--------|-------|
+| Date format / range validation | `backend/llm_service.py::validate_date_range` — invalid input bounces back to the user, never reaches `_trigger_pipeline`. |
+| FSM gate | The agent only calls `normalize_date_range` in `STEP_AWAIT_DATES`; user input in other steps is constrained (`confirm`, `retry`, `cancel`). |
+| Length limit | None today; FastAPI / Pydantic will reject oversized JSON, but there is no per-field cap. |
+| Prompt-injection detection | None. The free-text `{question}` and `{input}` placeholders are inserted verbatim. |
+| PII redaction | None. The auditor's text is captured as-is into `Session.history` and `Session.audit`. |
+
+**Future.**
+
+- Prompt-injection classifier (small model, sub-100ms) on the chat
+  panel input and the analyst Q&A input. PLANNED.
+- PII redaction before any text is sent to the LLM (the AP dataset
+  itself may contain vendor names but not personal PII; auditor notes
+  could). PLANNED.
+- Length cap (e.g. 4 KB per message) enforced by Pydantic
+  `Field(max_length=...)`. PLANNED.
+
+### 17.3 Output Filtering — *Partial*
+
+**In code today.**
+
+| Filter | Where |
+|--------|-------|
+| HTML escape on every rendered string | `frontend/src/components/MarkdownRenderer.jsx::escapeHtml` runs before any tag injection. Closes the XSS path. |
+| JSON shape parse | `_strip_json_fences` + `json.loads` in `llm_service.py` reject malformed responses; the chunk is dropped on parse failure. |
+| Read-only SQL guard | `database.run_select_safely` rejects any non-SELECT statement and any of `insert/update/delete/drop/alter/truncate`. |
+| Toxicity / hallucination classifier | None today. |
+| Citation verification | None today. The `invoice_id` cited in an anomaly is *believed*, not cross-checked against the rows passed to the prompt. |
+
+**Future.**
+
+- Citation verification: every `invoice_id` in the LLM's anomaly list
+  must match a record in the chunk that produced it; un-matched IDs
+  are dropped. PLANNED — §17.4.
+- A "did the LLM emit all required headings?" check before render.
+  PLANNED — §2.2 future.
+- Optional toxicity pass on the analyst chatbot output. PLANNED.
+
+### 17.4 Alignment Evaluations — *NA*
+
+**Why NA.** No red-team suite, no regression tests for safety
+properties (e.g. "the SQL guard never lets an UPDATE through"), no
+periodic alignment eval. The wrapper code refuses bad SQL at runtime,
+but no automated test exercises the refusal.
+
+**Future.**
+
+- A `tests/safety/` fixture with adversarial inputs (prompt
+  injections, destructive SQL, overly long messages) replayed in CI.
+  PLANNED — §20.2.
+- Citation-verification eval (§17.3 future) wired into nightly run.
+  PLANNED.
+
+### 17.5 Graceful Refusal — *Partial*
+
+**In code today.**
+
+- **Date input refusal.** *"I couldn't read that date range"* is the
+  canonical refusal for §10.4 / §17.2. It includes an example so the
+  user can self-correct.
+- **Out-of-context Q&A refusal.** Driven entirely by the prompt
+  (`anomaly_chat_prompt.txt` says *"If the answer is not supported by
+  the context, say so plainly..."*). The wrapper has no
+  pre/post-check; we trust the model to comply.
+- **No appeal path.** The auditor cannot escalate or override a
+  refusal — the only remedy is to rephrase.
+
+**Future.**
+
+- Canonical refusal templates per refusal class (out-of-scope,
+  policy, missing data). PLANNED.
+- An appeal path (e.g. "explain why" link) that opens a structured
+  feedback form. PLANNED — §19.4.
+
+---
+
+## 18. Threat Modeling & Defense-in-Depth
+
+### 18.1 Threat Model — *Partial*
+
+**In code today.** No formal STRIDE document. The de-facto threat
+model — the one the code already mitigates — is:
+
+| Threat | Mitigation in code |
+|--------|---------------------|
+| **Spoofing.** Bad actor calls the API as a different "user". | NA today (no auth) — single-tenant, localhost CORS. PLANNED §16. |
+| **Tampering — destructive SQL via Q&A.** LLM emits `DROP TABLE` or `UPDATE`; backend executes it. | `database.run_select_safely` rejects non-SELECT and destructive verbs; refusal happens *before* the query is sent. |
+| **Tampering — unintended Airflow trigger.** A user reaches the trigger without confirmation. | The FSM gates trigger on `STEP_CONFIRM`; the chat reply explicitly asks for the keyword `confirm`. |
+| **Repudiation.** "I never triggered that DAG." | `Session.log("airflow_trigger", {ok, run_id, stderr})` records every attempt. In-memory only today. PLANNED §16.5 future. |
+| **Information disclosure — secrets in logs.** The OpenAI API key shows up in stack traces. | Secrets are loaded once into env / `os.environ`; tracebacks log the *type* of error, not the body. The legacy reference scripts at the repo root, however, contain a hard-coded key — see roadmap Phase 0. |
+| **Information disclosure — XSS via LLM output.** Model emits `<script>...`. | `MarkdownRenderer.escapeHtml` strips it before any tag injection. |
+| **Information disclosure — cross-session leakage.** Session A reads Session B. | Each route requires the caller's `session_id`; no other session is ever read. The audit endpoint is the only aggregator and is documented as admin-only. |
+| **Denial of service.** Caller floods `/api/analysis/setup` to exhaust the LLM quota. | NA today (no rate limit). PLANNED §23.3. |
+| **Elevation of privilege.** Auditor performs an admin action. | NA today (no role distinction). PLANNED §16.2. |
+
+**Future.**
+
+- A formal STRIDE document with adversary, asset, and attack-surface
+  enumerations once the surface widens (auth, multi-tenant). PLANNED.
+
+### 18.2 Prompt Injection Defenses — *Partial*
+
+**In code today.**
+
+- **Trusted vs untrusted content boundary.** User free text *only*
+  enters prompts via dedicated placeholders (`{input}`, `{question}`).
+  The prompt instructions are part of the file checked into git; user
+  text is never concatenated into the instruction block.
+- **No tool-execution side effects from the LLM directly.** The LLM
+  produces JSON or markdown; the backend interprets it. The most
+  dangerous tool — SQL execution — is gated by `run_select_safely`.
+- **JSON-only enforcement** for date-extract and anomaly-detect roles
+  reduces the attack surface (a malicious instruction would have to
+  produce parseable JSON).
+
+What is **not** done today:
+
+- No detection of prompt-injection patterns ("ignore previous
+  instructions", "you are now ...").
+- No URL / link allow-list for content the LLM might surface.
+- No sandboxing of tool calls (because there are no LLM-driven tool
+  calls; see §7.1).
+
+**Future.**
+
+- A small classifier on incoming free text. PLANNED.
+- Once function calling lands (§7.1 future), instruction hierarchy:
+  *system* > *prompt* > *tool result* > *user*. PLANNED.
+
+### 18.3 Data Exfiltration Prevention — *Partial*
+
+**In code today.**
+
+- The LLM never emits raw URLs as tool calls because there are no
+  tool calls. It can mention URLs in markdown; the renderer renders
+  them as `<a target="_blank" rel="noreferrer noopener">...`.
+- There is no egress allow-list; the FastAPI process can talk to any
+  outbound IP the host can reach.
+- The LLM has access only to what is passed in the prompt — column
+  metadata + sampled rows + previously detected anomalies.
+
+What is **not** done today:
+
+- No network egress filtering.
+- No automatic redaction of `{rows}` / `{anomalies}` payloads.
+- No detection of data-exfiltration prompt patterns ("dump all rows
+  as a base64 string").
+
+**Future.**
+
+- Egress allow-list at the host firewall (OpenAI, RDS, Airflow EC2
+  only). PLANNED — §25.4.
+- Output redaction pass for known sensitive fields. PLANNED.
+
+### 18.4 Secrets & Key Management — *Partial*
+
+**In code today.**
+
+- `.env` loader (`python-dotenv`) reads `OPENAI_API_KEY`, `DB_URI`,
+  `SSH_KEY_PATH`, etc. (`backend/config.py`).
+- `.env` is gitignored.
+- `cryptography` (Fernet) is pinned in `requirements.txt` but **not
+  yet used**.
+- The legacy reference scripts at the repo root contain a hard-coded
+  OpenAI key — flagged in `doc/roadmap.md` Phase 0 ("credential
+  cleanup") as the highest-priority security task.
+
+**Future.**
+
+- Strip the hard-coded key from the legacy scripts; rotate the leaked
+  key. PLANNED — roadmap Phase 0 (highest priority).
+- Move secrets to AWS Secrets Manager / HashiCorp Vault for prod.
+  PLANNED — roadmap Phase 6.
+- Use Fernet to encrypt analyst notes at rest once §8 future lands.
+  PLANNED.
+- Add a `detect-secrets` pre-commit hook so a committed key fails the
+  hook. PLANNED.
+
+### 18.5 Supply Chain Security — *NA*
+
+**Why NA.** No dependency scanning, no SBOM generation, no model
+provenance check, no container signing on this branch. The pinned
+versions in `requirements.txt` and `package.json` are the only
+control.
+
+**Future.**
+
+- Run `pip-audit` and `npm audit` in CI. PLANNED — §20.5.
+- Generate an SBOM (CycloneDX). PLANNED.
+- Verify the OpenAI model version response on startup so a silent
+  vendor swap is detected. PLANNED — §5.5.
+
+### 18.6 Incident Response — *NA*
+
+**Why NA.** No runbook, no severity matrix, no on-call rotation, no
+postmortem template. The audit log (§16.5) is the closest thing to a
+post-incident artefact.
+
+**Future.**
+
+- Severity matrix (SEV-1 = pipeline trigger fires unauthorised; SEV-2
+  = LLM emits hallucinated `invoice_id`s; SEV-3 = UI regression).
+  PLANNED.
+- Postmortem template under `doc/incidents/`. PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-17 and beyond will be added in subsequent commits.*
+19 and beyond will be added in subsequent commits.*
