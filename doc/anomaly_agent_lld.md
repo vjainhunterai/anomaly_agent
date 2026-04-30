@@ -1490,5 +1490,227 @@ metrics do not apply.
 
 ---
 
+## 10. Orchestration & Control Flow
+
+### 10.1 Agent Loop — *Applicable*
+
+**In code today.** The Anomaly Agent does **not** use an autonomous
+*perceive → plan → act → observe → reflect* loop. It uses a one-step
+finite state machine driven by user input: each chat turn is a single
+"perceive (read message) → act (transition + maybe call tool) →
+observe (return reply)" round. There is no internal looping inside a
+turn, no max-step counter, and no reflection step.
+
+The driver lives in `backend/main.py::agent_chat`:
+
+```python
+@app.post("/api/agent/chat", response_model=ChatResponse)
+def agent_chat(req: ChatRequest) -> ChatResponse:
+    sess = store.require(req.session_id)
+    sess.add_turn("user", req.message.strip())
+    if _is_exit(user_msg): ...
+    elif sess.step in {STEP_GREET, STEP_AWAIT_DATES}:
+        reply = _handle_await_dates(sess, user_msg)
+    elif sess.step == STEP_CONFIRM:
+        reply = _handle_confirm(sess, user_msg)
+    elif sess.step == STEP_PROCESSING: ...
+    elif sess.step == STEP_ERROR: ...
+    sess.add_turn("assistant", reply)
+    return ChatResponse(...)
+```
+
+Step limits, recursion depth, max-tool-calls — all NA today because
+each turn is a single transition.
+
+**Future.**
+
+- A multi-step agent loop becomes meaningful only after function
+  calling lands (§7.1 future). At that point: cap at N tool calls per
+  turn; emit a `step_count` field on each `ChatResponse`. PLANNED.
+- Reflection / self-critique step where the LLM grades its own anomaly
+  list before returning. PLANNED — §17.4.
+
+### 10.2 Planning Strategies — *NA*
+
+**Why NA.** ReAct, Plan-and-Execute, and Tree-of-Thoughts all assume
+the LLM is choosing what to do next. The Anomaly Agent's "plan" is
+fixed: the FSM dictates the next action; the LLM only chooses the
+*content* of the response, not the *control flow*.
+
+**Future.** Planning becomes meaningful after §7.1 future lands.
+PLANNED.
+
+### 10.3 State Machine — *Applicable*
+
+**In code today.** Explicit, hand-rolled. States are constants in
+`backend/session_manager.py`:
+
+```python
+STEP_GREET       = "greet"
+STEP_AWAIT_DATES = "await_dates"
+STEP_CONFIRM     = "confirm"
+STEP_PROCESSING  = "processing"
+STEP_DONE        = "done"
+STEP_ERROR       = "error"
+```
+
+Transitions:
+
+| From | Input | To | Side effect |
+|------|-------|----|-------------|
+| `greet` / `await_dates` | free text | `confirm` | `normalize_date_range` + `validate_date_range` |
+| `await_dates` | invalid input | `await_dates` | none |
+| `confirm` | `confirm` / `yes` / `y` / `ok` / `go` / `run` | `processing` → `done` / `error` | metadata write + Airflow trigger |
+| `confirm` | anything else | `await_dates` | re-parse |
+| `error` | `retry` / `rerun` | `done` / `error` | re-trigger pipeline |
+| any | `exit` / `quit` / `cancel` | `done` | session ends |
+
+Terminal conditions: `STEP_DONE` (success), `STEP_ERROR` (recoverable
+via `retry`).
+
+**Future.**
+
+- Add a `STEP_AWAITING_AIRFLOW` once Airflow REST polling is in (§3.1
+  future + roadmap Phase 2). The current `done` step optimistically
+  fires on a successful trigger. PLANNED.
+
+### 10.4 Interruption & Human-in-the-Loop — *Applicable*
+
+**In code today.**
+
+- **Confirmation gate.** `STEP_CONFIRM` is the explicit human-approval
+  step. Nothing writes to the metadata table or invokes Airflow until
+  the user types `confirm`.
+- **Clarification request.** When `validate_date_range` returns
+  `False`, the agent asks again rather than guessing
+  (`_handle_await_dates`).
+- **Cancel.** `exit`/`quit`/`cancel` at any time terminates the
+  session.
+- **Retry.** After `STEP_ERROR`, the user types `retry` to re-run
+  `_trigger_pipeline`.
+
+**Future.**
+
+- Hand-off to a human reviewer on high-severity anomalies (escalation
+  channel). PLANNED — §1.2.
+- Mid-run abort during `/api/analysis/setup` (today the request
+  blocks until `format_report` returns). PLANNED.
+
+### 10.5 Determinism Levers — *Applicable*
+
+**In code today.**
+
+| Lever | Setting | Where |
+|-------|---------|-------|
+| Temperature | `0` | `OPENAI_TEMPERATURE=0` in `backend/config.py`; passed into `ChatOpenAI`. |
+| Seeded generation | not used | OpenAI's `seed` parameter is not passed (LangChain `ChatOpenAI` does support it; would need a constructor change). |
+| Schema-constrained outputs | enforced by prompt + post-parse | JSON-emitting prompts (date_extract, anomaly) declare the JSON shape; `_strip_json_fences` + `json.loads` parse; bad output is dropped (`detect_anomalies`). |
+| Required-headings contract | enforced by prompt | `anomaly_format_prompt` (4 headings); `reconciliation_prompt` (5 headings). No runtime check yet (§2.2 future). |
+
+**Future.**
+
+- Pass OpenAI's `seed` parameter for byte-stable replays in the eval
+  harness. PLANNED — §20.2.
+- Use OpenAI / Claude *response_format=json_schema* (or LangChain's
+  `with_structured_output`) for the JSON-emitting roles, replacing
+  prompt-based JSON enforcement. PLANNED.
+
+---
+
+## 11. Conversation Design & State
+
+### 11.1 Turn Structure — *Applicable*
+
+**In code today.**
+
+- A *turn* is a single user message + the assistant reply. There is no
+  multi-message turn and no tool-call interleaving (§7 future).
+- Each turn is one HTTP round-trip: `POST /api/agent/chat` →
+  `ChatResponse`.
+- The user is gated from typing while the request is in flight
+  (`busy` state in `frontend/src/panels/AgentChatPanel.jsx`).
+
+**Future.**
+
+- Multi-message assistant turns once streaming lands (§14.2). PLANNED.
+- Inline tool-call traces (e.g. "running SQL ...") once §7.1 future
+  is done. PLANNED.
+
+### 11.2 Context Window Management — *Applicable*
+
+**In code today.**
+
+- **Sampling, not summarisation.** `understand_dataset` uses the first
+  200 rows. `status_qa` uses the first 50 rows. The chunked anomaly
+  detector processes 200 rows per call, returning consolidated
+  results.
+- **No accumulation across turns.** Every prompt re-builds its full
+  context from scratch — `Session.history` is *displayed*, not
+  *replayed*. A long chat does not bloat the next prompt.
+- **No summarisation, no sliding window, no pinning.** The fixed
+  sampling caps are the only form of window management.
+
+**Future.**
+
+- Token-aware truncation of the `{anomalies}` and `{rows}` payloads
+  with a deterministic ranking (severity desc, recency desc) before
+  truncation. PLANNED.
+- Periodic summarisation of `Session.history` once any prompt starts
+  replaying it. PLANNED.
+
+### 11.3 Conversation Persistence — *Partial*
+
+**In code today.**
+
+- `Session.history` lives in process memory (§8.1).
+- The frontend never stores chat history in `localStorage` or a
+  cookie; reloading the page does not restore the chat (the
+  `AgentChatPanel` calls `POST /api/agent/start` on every mount).
+- There is no replay endpoint, no export endpoint, no history UI
+  beyond the active panel.
+
+**Future.**
+
+- Persist `Session.history` to Postgres. PLANNED — roadmap Phase 1.
+- `GET /api/agent/sessions` and `GET /api/agent/session/{id}/history`
+  for replay / export. PLANNED.
+- Chat history sidebar in the UI. PLANNED.
+
+### 11.4 Multi-Session Continuity — *NA*
+
+**Why NA.** Today there is **no bridge** between sessions. Each new
+`POST /api/agent/start` allocates a fresh `Session` with empty
+`history`, empty `analysis`, and empty `audit`. Prior runs' anomaly
+detections are not surfaced — the `{memory}` placeholder is the
+literal string `"[]"` (§8.3).
+
+**Future conditions for this subsection becoming Applicable.**
+
+- §8.1 long-term memory lands. At that point the analyst panel can
+  surface "you flagged 4 ACME duplicates last week — still suspicious
+  this run?". PLANNED.
+
+### 11.5 Conversation Reset & Branching — *Partial*
+
+**In code today.**
+
+- **Reset.** Header *New Session* button in `App.jsx`:
+  `handleNewSession()` bumps `resetKey`, which is passed as the `key`
+  prop on each panel; React unmounts and re-creates them with empty
+  state. The backend `Session` is *abandoned*, not deleted (it
+  remains in `SessionStore` until process exit).
+- **Branching.** Not supported. There is no fork-this-conversation,
+  no share-as-link, no diff between two conversation branches.
+
+**Future.**
+
+- `POST /api/agent/session/{id}/reset` that explicitly drops the old
+  session. PLANNED.
+- Fork-and-edit: clone a session at turn N, change a date, see the
+  difference in the resulting analysis. PLANNED.
+- Share-as-link with a read-only token. PLANNED — depends on §16.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-10 and beyond will be added in subsequent commits.*
+12 and beyond will be added in subsequent commits.*
