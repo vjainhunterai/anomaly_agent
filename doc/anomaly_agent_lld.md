@@ -183,5 +183,263 @@ in §14 but explicitly out of scope for the current branch.
 
 ---
 
+## 2. Agent Identity, Persona & Voice
+
+### 2.1 Persona Definition — *Applicable*
+
+**In code today.**
+
+| Attribute | Value |
+|-----------|-------|
+| Name (user-facing) | "Anomaly Detection Agent" |
+| Internal product name | Anomaly Agent (sister product to AdminFee Agent) |
+| Role | Specialist assistant for duplicate-AP-invoice anomaly review |
+| Expertise level | Finance audit + MySQL data review; not a general-purpose chatbot |
+| Tone | Direct, professional, audit-grade |
+| Register | Business-formal; markdown formatting (lists, tables, code spans) |
+| Speaking voice | First-person singular when greeting; otherwise impersonal report style |
+| Anchor strings | `GREETING` constant in `backend/main.py` defines the opening turn verbatim |
+
+The greeting that establishes the persona on every new session
+(`backend/main.py`):
+
+```text
+Hello — welcome to the **Anomaly Detection Agent**.
+Please provide a date range (e.g. `2024-12-25 to 2025-12-25`)
+or type `exit` to quit.
+```
+
+The persona is reinforced by every prompt under `prompts/` — each opens
+with a role line such as *"You are the Anomaly Agent's analyst chatbot"*
+or *"You are an anomaly detection engine for an Accounts Payable
+duplicate invoice dataset."*
+
+**Future.**
+
+- Configurable persona / multi-persona support (e.g. *strict auditor*
+  vs. *explainer* mode). Today the persona is hard-coded in prompt
+  files. PLANNED — see §5.1 and roadmap Phase 4.
+- Localised persona (non-English variants). All prompts and fixed
+  strings are English-only. PLANNED.
+
+### 2.2 Voice & Style Guide — *Applicable*
+
+#### Defaults enforced by prompts (in code today)
+
+| Style rule | Where it lives |
+|------------|----------------|
+| Sentence length: short. *"Direct, 2–6 sentences"* | `prompts/anomaly_chat_prompt.txt` |
+| Sentence length: *"1–4 sentences"* | `prompts/status_prompt.txt` |
+| Length cap: *"under ~250 words"* | `prompts/reconciliation_prompt.txt` |
+| Formality: business-formal, no slang, no humor | All prompts |
+| Markdown required (no HTML) | `prompts/anomaly_format_prompt.txt` |
+| Citations: always reference `invoice_id` for specific records | `prompts/anomaly_chat_prompt.txt` |
+| Required headings (4 sections) for the anomaly report | `prompts/anomaly_format_prompt.txt` |
+| Required headings (5 sections) for the reconciliation report | `prompts/reconciliation_prompt.txt` |
+
+#### Frontend rendering rules (in code today)
+
+- Markdown is parsed by a hand-rolled component
+  (`frontend/src/components/MarkdownRenderer.jsx`).
+- Supported: H1–H4 (rendered as H2–H5 to avoid clashing with panel
+  headings), bold, italic, inline code, fenced code blocks, ordered /
+  unordered lists, GitHub-style tables, links.
+- All inline content is HTML-escaped before tag injection — there is no
+  path for an LLM response to inject `<script>` tags.
+- Code blocks render with a `lang-<name>` class; the SQL view in the
+  analyst panel exploits this for `lang-sql` styling.
+- Long status answers and reconciliation reports scroll inside the
+  panel, not the page (see `.analysis-output` overflow rule in
+  `frontend/src/index.css`).
+
+#### Known inconsistency
+
+- **Emoji policy.** `backend/main.py` uses `✅`, `⚠️`, `❌` glyphs in
+  three fixed assistant strings (pipeline triggered, soft failure, hard
+  failure). Prompts neither encourage nor explicitly forbid emoji in
+  LLM output. Status: **PARTIAL** — works, but is not stated centrally.
+
+**Future.**
+
+- Add an explicit *"no emoji in LLM output"* rule to every prompt. PLANNED.
+- Lint-style validation that LLM output meets the required heading set
+  (catch missing sections before render). PLANNED — see §20.
+- Central style-guide file in repo for prompt authors. PLANNED.
+
+### 2.3 Communication Principles — *Applicable*
+
+#### Principles enforced by prompts (in code today)
+
+- **Honesty over fluency.** *"If the answer is not supported by the
+  context, say so plainly and suggest what information would be needed."*
+  — `prompts/anomaly_chat_prompt.txt`. The chat agent never invents
+  columns or invoice IDs.
+- **Epistemic humility.** *"If the question is outside this scope, say
+  so."* — `prompts/status_prompt.txt`.
+- **Pushback on invalid input.** The chat FSM responds to a malformed
+  date with *"I couldn't read that date range"* plus an example, instead
+  of guessing (`backend/main.py::_handle_await_dates` →
+  `validate_date_range`).
+- **Confirmation before side effects.** The agent never writes to
+  `anomaly_metadata` or triggers Airflow on the first turn — it parses,
+  echoes the parsed range, and waits for `confirm`
+  (`backend/main.py::_handle_confirm`).
+
+#### Failure-mode behaviour (in code today)
+
+| Failure | What the user sees |
+|---------|--------------------|
+| LLM unreachable / quota exhausted | Each `llm_service.py` function has a deterministic fallback (regex, plain-table, static summary). The narrative degrades; the page does not crash. |
+| LLM returns malformed JSON | Strip ```json fences, try `json.loads`, log a warning, drop the chunk. Remaining chunks continue. |
+| Airflow SSH fails | Metadata is already written; assistant says *"Metadata was written but the Airflow trigger failed"* with `stderr` in a fenced block, and instructs the user to reply `retry`. |
+| DB unreachable | `/api/health` flips `db: "down"`; the header badge in `App.jsx` turns amber. |
+
+**Future.**
+
+- Confidence scoring on anomalies (separate dimension from `severity`).
+  Today only `severity` (low/medium/high) is emitted. PLANNED — §5, §17.
+- Refusal templates for out-of-scope questions. The chat prompt
+  instructs the model to say so, but there is no canonical refusal
+  template. PLANNED.
+
+### 2.4 Brand Alignment — *Applicable*
+
+#### Visual & UX parity with AdminFee Agent (in code today)
+
+- Same 3-panel layout: chat (left) / status monitor (centre) / analyst
+  (right). `frontend/src/App.jsx` mirrors AdminFee's `App.jsx` structure.
+- Same header treatment: brand dot + product name + tagline + health
+  badge + *New Session* button (`frontend/src/index.css` `.app-header`).
+- Same monospace status chips for FSM steps (`.step-chip` with per-state
+  colour variants).
+- Same dark theme via CSS variables in `:root` (`--bg`, `--accent`,
+  `--ok`, `--warn`, `--err`) so a switch to the AdminFee theme is one
+  variable change.
+- Same step-based FSM in the backend; AdminFee Agent uses the same
+  `session_manager` pattern (UUID dict, `threading.Lock`).
+
+#### Brand voice continuity (in code today)
+
+- Both agents introduce themselves with the product name in **bold** and
+  ask for one concrete input before doing anything.
+- Both products use markdown reports with required section headings to
+  make outputs scannable for auditors.
+- Both products surface backend health in the header so the operator
+  can tell at a glance whether the LLM/DB are reachable.
+
+**Future.**
+
+- Shared component library / design-tokens package between the two
+  apps. Today the patterns are duplicated between repos. PLANNED.
+- Brand kit (logo, colour palette, typography spec) in repo. The
+  `brand-dot` is a CSS pseudo-element today; no actual logo asset
+  exists. PLANNED.
+- Light-theme + theme switcher. Variables are dark-only today; the
+  `var(...)` structure already supports a sibling
+  `[data-theme="light"]` block. PLANNED.
+- Internationalisation (i18n) of UI strings. PLANNED.
+
+### 2.5 Example Interactions — *Applicable*
+
+Each transcript below is a literal output of code on this branch.
+Assistant turns come from `backend/main.py` + `prompts/*`; user turns
+are exactly what the analyst types in the chat panel.
+
+#### Example 1 — Happy path: greeting → confirm → trigger
+
+```text
+AGENT: Hello — welcome to the **Anomaly Detection Agent**.
+Please provide a date range (e.g. `2024-12-25 to 2025-12-25`) or type `exit` to quit.
+
+USER: 2024-01-01 to 2024-12-31
+
+AGENT: I parsed:
+
+- **Start date:** `2024-01-01`
+- **End date:** `2024-12-31`
+
+Reply `confirm` to run the anomaly pipeline or send a new range.
+
+USER: confirm
+
+AGENT: ✅ Anomaly pipeline triggered.
+
+- **Run ID:** `anomaly_20260101_143012`
+- **Range:** `2024-01-01` → `2024-12-31`
+
+Watch the **Status Monitor** panel for progress.
+```
+
+#### Example 2 — Pushback on invalid input
+
+```text
+USER: last quarter sometime
+
+AGENT: I couldn't read that date range (Missing start or end date).
+Please try again, e.g. `2024-01-01 to 2024-12-31`.
+```
+
+When the LLM cannot extract dates, the regex fallback in
+`backend/llm_service.py::_normalize_with_regex` returns `(None, None)`;
+`validate_date_range` flags it; the agent does not guess.
+
+#### Example 3 — Soft failure of the Airflow trigger
+
+```text
+USER: confirm
+
+AGENT: ⚠️ Metadata was written but the Airflow trigger failed:
+
+​```
+ssh: connect to host 172.31.25.132 port 22: Connection timed out
+​```
+
+Fix the SSH / DAG configuration and reply `retry`.
+```
+
+#### Example 4 — Analyst follow-up Q&A (with optional SQL)
+
+```text
+USER (analyst panel): Which vendor has the most duplicates?
+
+AGENT: Vendor `ACME Logistics` accounts for 6 of the 17 detected
+duplicates, all in the `2024-Q3` window. Two of those (`INV-1042`,
+`INV-1071`) are exact-amount near-duplicates separated by 2 days; the
+other four are split-payment patterns under the `vendor_alias` value
+`ACME LOG.`
+
+[expandable: Generated SQL]
+SELECT vendor_name, COUNT(*) AS duplicate_count
+FROM anomaly.duplicate_ap_invoice
+GROUP BY vendor_name
+ORDER BY duplicate_count DESC
+LIMIT 200
+```
+
+The natural-language answer is produced by `chat_about_anomalies`
+(`prompts/anomaly_chat_prompt.txt`). The SQL leg is opportunistic —
+`generate_sql` + `database.run_select_safely`; if `generate_sql` returns
+empty or the SQL is rejected, the answer still renders without the
+expandable block.
+
+#### Example 5 — Status Q&A from the centre panel
+
+```text
+USER: How many high-severity anomalies are there?
+
+AGENT: There are 4 high-severity anomalies in the current run
+(out of 17 total). The latest update was at 14:31 UTC.
+```
+
+**Future.**
+
+- Persistent transcripts across sessions / replay. Today
+  `Session.history` is in-process only; lost on backend restart.
+  PLANNED — roadmap Phase 1.
+- These five examples become "gold-standard" eval fixtures, not just
+  documentation. PLANNED — §20.2.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-2 and beyond will be added in subsequent commits.*
+3 and beyond will be added in subsequent commits.*
