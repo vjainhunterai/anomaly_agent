@@ -737,5 +737,151 @@ each with the alternative considered and why it was not chosen.
 
 ---
 
+## 4. Multi-Agent Topology & Roles
+
+> **Section orientation.** The Anomaly Agent is a *single-agent* system
+> driven by a hand-rolled FSM (see ADR-1 in §3.5). It does not have a
+> multi-agent topology, supervisor router, or inter-agent handoff. Most
+> subsections of this LLD chapter are therefore **NA**. The two that
+> have a meaningful analogue — *logical LLM roles* and *concurrency /
+> scaling rules for the one agent we do have* — are filled in below.
+
+### 4.1 Agent Roster — *Applicable (loose interpretation)*
+
+**In code today.** There is exactly one *agent* in the architectural
+sense: the FastAPI session, which owns the FSM, the audit log, and the
+analysis cache (`backend/session_manager.Session`). What the LLD
+template calls a "specialised agent" maps in this codebase to a
+**logical LLM role** — a distinct prompt + caller pair invoked by the
+single backend agent.
+
+There are eight such logical roles, all backed by `backend/llm_service.py`
+and prompts under `prompts/`:
+
+| Logical role | Caller (backend) | Prompt file | Inputs | Output | Where used |
+|--------------|------------------|-------------|--------|--------|------------|
+| Date extractor | `normalize_date_range` | `date_extract_prompt.txt` | Free-text date range from the chat panel | JSON `{start_date, end_date}` | `_handle_await_dates` (chat FSM) |
+| Dataset summariser | `understand_dataset` | `understanding_prompt.txt` | First 200 rows of `duplicate_ap_invoice` + column metadata | Markdown narrative ≤ 180 words | `/api/analysis/setup` |
+| Anomaly detector | `detect_anomalies` | `anomaly_prompt.txt` | One 200-row chunk + understanding + memory + columns | JSON array of anomaly objects | `/api/analysis/setup` (looped per chunk) |
+| Report formatter | `format_report` | `anomaly_format_prompt.txt` | Deduped anomaly list | Markdown report with 4 fixed sections | `/api/analysis/setup` |
+| Analyst chatbot | `chat_about_anomalies` | `anomaly_chat_prompt.txt` | Question + anomalies + understanding + columns | 2–6 sentence markdown answer | `/api/analysis/ask` |
+| Status assistant | `status_qa` | `status_prompt.txt` | Question + summary + 50-row sample | 1–4 sentence markdown answer | `/api/status/ask` |
+| SQL generator | `generate_sql` | `sql_prompt.txt` | Question + column metadata + table FQN | Single MySQL `SELECT` (fenced) | `/api/analysis/ask` (opportunistic) |
+| Reconciler | `reconciliation_report` | `reconciliation_prompt.txt` | Date range + summary + anomalies sample | Markdown report with 5 fixed sections | `/api/reports/reconciliation` |
+
+All eight roles share a single `ChatOpenAI` client constructed once in
+`get_llm()`; there is no per-role model selection, no per-role API key,
+and no separate process per role.
+
+**Future.**
+
+- Promote one or more of these roles to a true **separate agent** — for
+  example, an evaluator agent that judges the anomaly detector's output
+  before the auditor ever sees it. PLANNED — §17 + §20.2.
+- Per-role model routing (cheap model for date extraction, premium
+  model for analyst Q&A). PLANNED — §5.2.
+- A *planner* agent that decomposes a complex auditor question into a
+  pipeline of role calls. PLANNED — §10.2.
+
+### 4.2 Coordination Pattern — *NA*
+
+**Why NA.** The architecture has no supervisor, router, swarm, or
+hierarchical pattern to choose between. There is exactly one agent (the
+FastAPI session); coordination happens through:
+
+- A finite state machine inside the agent
+  (`STEP_GREET → STEP_AWAIT_DATES → STEP_CONFIRM → STEP_PROCESSING →
+  STEP_DONE | STEP_ERROR`, defined in `backend/session_manager.py`).
+- Three parallel UI panels in the browser that call distinct backend
+  routes; the panels do not negotiate with each other — they read
+  shared state held in `App.jsx`.
+
+Neither of those is "multi-agent coordination" in the sense the LLD
+template means.
+
+**Future.** A coordinator pattern will become applicable if one of the
+PLANNED items in §4.1 lands (e.g. an evaluator agent that runs after
+the anomaly detector). At that point this subsection should be
+re-labelled *Applicable* and a topology written.
+
+### 4.3 Handoff Protocol — *NA*
+
+**Why NA.** There are no agent-to-agent handoffs because there is only
+one agent. The closest analogue is the **panel-to-panel propagation**
+mediated by `App.jsx`:
+
+- `AgentChatPanel` → `App` via `onRangeSelected({start_date, end_date})`,
+  which sets `activeDelivery`.
+- `StatusMonitorPanel` → `App` via `onProcessingComplete(contracts)`,
+  which sets `processingComplete = true`.
+- `App` → `AnalysisPanel` via the `processingComplete` prop, which
+  triggers `autoFiredRef`-gated `runSetup`.
+
+That is *intra-frontend state propagation*, not a handoff protocol
+between agents. Documented for completeness only.
+
+**Future.** A handoff protocol will be needed if a second agent is
+introduced (PLANNED, §4.1). Likely shape: a structured "trace"
+attached to the `Session`, with each agent appending a typed step.
+
+### 4.4 Conflict Resolution — *NA*
+
+**Why NA.** With one agent there is no possibility of two agents
+disagreeing or producing contradictory outputs. Within the single
+agent, the closest concept is **deduplication** of LLM output across
+chunks:
+
+- `detect_anomalies` runs the LLM once per 200-row chunk; results are
+  merged and deduped on `invoice_id` so the same record cannot appear
+  twice (`backend/llm_service.py`):
+
+```python
+unique = {a.get("invoice_id") or a.get("id") or json.dumps(a, sort_keys=True, default=str): a for a in all_anomalies}
+return list(unique.values())
+```
+
+That is consistency enforcement, not conflict arbitration.
+
+**Future.** Conflict resolution becomes meaningful only if a second
+agent (e.g. evaluator) can disagree with the anomaly detector. PLANNED
+— §17.
+
+### 4.5 Scaling Rules — *Applicable*
+
+The "scaling" question for this app is *how the single agent handles
+many input rows*, not how many agent instances to spawn.
+
+**In code today.**
+
+- **Sequential chunking.** `detect_anomalies` iterates over 200-row
+  chunks, invoking the LLM once per chunk. Chunk size constant:
+  `chunk_size: int = 200` in `backend/llm_service.py`. No parallelism;
+  chunks are processed in source order.
+- **Single concurrent session per backend process.** `SessionStore` is
+  thread-safe (one `threading.Lock`) and supports many sessions
+  simultaneously, but uvicorn is started with default worker count
+  (`reload=True` implies one worker), so practical parallelism is one.
+- **Single-row metadata table.** `anomaly_metadata` is truncated and
+  re-inserted on every confirm (`upsert_anomaly_metadata`); two
+  concurrent runs would race. Mitigated today by single-operator
+  assumption.
+
+**Future.**
+
+- **Parallelise anomaly chunks** with `asyncio.gather` or a thread
+  pool. Constraints: per-OpenAI-key rate limit; preserve dedup on
+  `invoice_id` so order does not matter. PLANNED.
+- **Multi-worker uvicorn / gunicorn** for prod. Requires a persistent
+  session store first (in-memory dict cannot span workers). PLANNED —
+  roadmap Phase 1 + Phase 6.
+- **Multi-row metadata table** keyed by `run_id` so concurrent runs do
+  not race. PLANNED — roadmap Phase 2.
+- **Spawn-parallel agents** rule: if the evaluator agent (PLANNED,
+  §4.1) is added, run it in parallel with the report formatter on the
+  same anomaly list, since their inputs do not depend on each other.
+  PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-4 and beyond will be added in subsequent commits.*
+5 and beyond will be added in subsequent commits.*
