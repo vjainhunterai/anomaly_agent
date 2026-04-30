@@ -3070,5 +3070,199 @@ warehouse, no analyst-facing BI dashboard sourced from this app.
 
 ---
 
+## 25. Deployment & Infrastructure
+
+> **Section orientation.** The Anomaly Agent runs as a **local dev
+> deployment** today (uvicorn + Vite on a single Windows / Linux
+> machine). Most of §25 is therefore **NA today**.
+
+### 25.1 Environments — *Partial*
+
+**In code today.**
+
+| Environment | Status |
+|-------------|--------|
+| `dev` (local laptop) | The only environment. Backend on `:8000`, frontend on `:3000`, MySQL on RDS, Airflow on EC2, OpenAI in the cloud. Configuration lives in a developer-local `.env`. |
+| `staging` | Does not exist. |
+| `canary` | Does not exist. |
+| `prod` | Does not exist. |
+
+**Parity rules.** Trivially satisfied today (everyone runs the same
+local environment). The future-prod section below restates them
+explicitly.
+
+**Future.**
+
+- Three environments: `dev`, `staging`, `prod`. PLANNED — roadmap
+  Phase 6.
+- Parity rules: same Python/Node versions, same prompt files, same DB
+  schema. Differences only in config (DB host, model, secrets).
+- No production data in dev — synthetic dataset for `dev` /
+  `staging`. PLANNED.
+
+### 25.2 CI/CD Pipeline — *NA*
+
+**Why NA.** No `.github/workflows/`, no Jenkins / Azure Pipelines.
+Builds happen on the developer's laptop; deployments are *"run
+`python run_backend.py`"*.
+
+**Future.** GitHub Actions pipeline:
+
+1. Lint (`ruff` + `eslint`).
+2. Type check (`pyright` once typing tightened).
+3. Unit / integration tests (§20.1 future).
+4. LLM eval threshold (§20.2 future).
+5. Build container images (§25.4).
+6. Deploy to staging on `main` push.
+7. Deploy to prod after manual approval.
+
+PLANNED — roadmap Phase 6.
+
+### 25.3 Infrastructure-as-Code — *NA*
+
+**Why NA.** No Terraform, no Pulumi, no AWS CDK. The RDS instance and
+the Airflow EC2 host pre-exist this app and are managed elsewhere.
+
+**Future.**
+
+- Adopt Terraform for any new infrastructure this app introduces
+  (Postgres for sessions / audit, S3 bucket, ECS service). PLANNED.
+- Module structure: one Terraform module per environment; shared
+  modules for `network`, `db`, `app`. PLANNED.
+- Drift detection via `terraform plan` in CI on a schedule. PLANNED.
+
+### 25.4 Container & Orchestration — *NA*
+
+**Why NA.** No `Dockerfile`, no `docker-compose.yml`, no Kubernetes
+manifests. The app runs as two foreground processes today.
+
+**Future.**
+
+- **Backend Dockerfile.** Multi-stage Python 3.11-slim image; copy
+  `backend/`, `prompts/`, `requirements.txt`; run uvicorn behind
+  gunicorn workers; healthcheck against `/api/health`. PLANNED.
+- **Frontend Dockerfile.** Build Vite to `dist/`; serve via nginx with
+  the `/api` location proxying to the backend service. PLANNED.
+- **`docker-compose.yml`** for local dev that mirrors prod topology.
+  PLANNED.
+- **Kubernetes** when scale or multi-tenant lands. PLANNED — likely
+  Phase 7+.
+
+### 25.5 Release Strategy — *NA*
+
+**Why NA.** No deploy story → no release strategy. The "release" is
+the next time the developer runs `git pull`.
+
+**Future.**
+
+- Blue/green for backend deploys. PLANNED.
+- Canary route a small % of traffic to a candidate prompt or model
+  via §15.4 future feature flags. PLANNED.
+- Rollback SLA: < 5 minutes to revert via re-deploying the previous
+  image tag. PLANNED.
+
+---
+
+## 26. Reliability & Resilience
+
+### 26.1 SLOs & Error Budgets — *NA today*
+
+**Why NA.** No SLO file, no error budget, no burn-rate alert. We do
+not track latency or error rate (§21).
+
+**Future.** Proposed SLOs once telemetry lands:
+
+| SLO | Target | Measurement |
+|-----|--------|-------------|
+| Backend availability | 99.5% over 30 days | `/api/health` from a synthetic monitor. |
+| `/api/agent/chat` p95 latency | < 4 s | Server-side timing histogram. |
+| `/api/analysis/setup` p95 latency | < 90 s for ≤ 12-month window | Server-side timing histogram. |
+| Anomaly JSON parse rate | > 95% | Ratio of successful `json.loads` over total chunk responses. |
+
+PLANNED — roadmap Phase 6.
+
+### 26.2 Failure Modes — *Applicable*
+
+**In code today.** Each external dependency has a documented failure
+mode and a per-mode response.
+
+| Failure | Code response | User-visible result |
+|---------|---------------|---------------------|
+| OpenAI 5xx / timeout / quota | `invoke_llm` returns `""`; deterministic fallback supplies a non-empty string. | Narrative degrades (regex-extracted dates, plain-table report); page does not crash. |
+| MySQL unreachable | DB read helpers return empty / zero with a logged warning; `_trigger_pipeline` fails fast and surfaces the exception. | Status panel shows `0` records; chat shows the DB exception verbatim. |
+| Airflow SSH timeout / auth | `trigger_airflow_dag` returns `TriggerResult(ok=False)`. | Assistant explains in chat with stderr; `STEP_ERROR`; `retry` is offered. |
+| FastAPI process crash | uvicorn restarts on save (dev). In prod, NA today. | All sessions lost. |
+| Frontend fetch error | `services/api.js` raises a JS `Error`; each panel renders the `.panel-error` block. | The other panels keep working. |
+
+**Future.**
+
+- Document the failure mode for OpenAI prompt-cache invalidation once
+  §22.3 future lands. PLANNED.
+- Document Airflow DAG SUCCESS / FAILED handling once §3.1 future
+  lands. PLANNED.
+
+### 26.3 Fallback & Degraded Modes — *Applicable*
+
+**In code today.** This is one of the strongest properties of the
+codebase (ADR-4). Each public function in `backend/llm_service.py`
+has a non-LLM fallback:
+
+| Role | Fallback |
+|------|----------|
+| `normalize_date_range` | Regex over the user's free text (`_normalize_with_regex`). |
+| `understand_dataset` | Static placeholder string ("Dataset understanding unavailable"). |
+| `detect_anomalies` | Empty list (the analyst sees a "0 anomalies" report instead of a crash). |
+| `format_report` | Hand-built markdown table from the keys of the anomaly dicts. |
+| `chat_about_anomalies` | `"I couldn't generate an answer right now. Please try again."` |
+| `status_qa` | `"Status information is temporarily unavailable."` |
+| `generate_sql` | Empty string; `analysis_ask` skips the SQL leg. |
+| `reconciliation_report` | Static markdown summary built from the real counts. |
+
+The frontend has its own degraded modes:
+
+- Health badge amber when `/api/health` reports `db: down`.
+- Per-panel `.panel-error` block scoped so one panel's failure does
+  not break the others.
+
+**Future.**
+
+- A fallback model (§5.1 future) gives a richer narrative even when
+  OpenAI is down. PLANNED.
+- Cached "last good" reconciliation so a network blip does not blank
+  the analyst panel. PLANNED.
+
+### 26.4 Backup & Disaster Recovery — *NA*
+
+**Why NA.** Every piece of state this app produces is in-process
+(`SessionStore`). Backup of in-memory state is meaningless. The
+underlying MySQL instance is backed up by RDS automated snapshots,
+which is outside the scope of this app.
+
+**Future conditions for becoming Applicable.**
+
+- Phase 1 lands a Postgres-backed session / audit store. At that
+  point: RPO 1 hour, RTO 4 hours, automated nightly snapshot, monthly
+  restore drill. PLANNED.
+
+### 26.5 Circuit Breakers & Bulkheads — *NA*
+
+**Why NA.** No circuit breaker library (`pybreaker`, `tenacity`-based
+bulkhead). No bulkheading between calls. A hung Airflow host blocks
+the FastAPI request thread until Paramiko times out
+(`backend/airflow_trigger.py` sets `timeout=15` on connect, `timeout=60`
+on exec — those are the only protections).
+
+**Future.**
+
+- `tenacity`-based retry with exponential backoff + jitter on
+  `trigger_airflow_dag` and `invoke_llm`. PLANNED — `tenacity` is
+  already imported in the legacy script (`anomaly_processing_agent.py`).
+- Circuit breaker around the SSH host so a long-broken host does
+  not eat thread pool capacity. PLANNED.
+- Bulkhead: dedicate one thread pool to LLM calls and another to DB
+  / SSH so a slow LLM does not starve a fast DB read. PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-25 and beyond will be added in subsequent commits.*
+27-28 will be added in the final commit.*
