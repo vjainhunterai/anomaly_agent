@@ -883,5 +883,166 @@ many input rows*, not how many agent instances to spawn.
 
 ---
 
+## 5. LLM Strategy & Model Selection
+
+> **Section orientation.** The Anomaly Agent uses a single LLM
+> (OpenAI `gpt-4.1-mini`) for every logical role listed in §4.1. There
+> is no fallback model, no routing logic, and no fine-tuning on this
+> branch. §5.1 and §5.3 are *Applicable*; §5.2, §5.4, §5.5 are **NA**
+> today, with the future conditions under which each would become
+> applicable.
+
+### 5.1 Model Portfolio — *Applicable*
+
+#### In code today
+
+A single-row portfolio. The model is constructed once on first call in
+`backend/llm_service.py::get_llm` and memoised:
+
+```python
+_llm = ChatOpenAI(model=OPENAI_MODEL, temperature=OPENAI_TEMPERATURE)
+```
+
+| Slot | Model | Provider | Env override | Notes |
+|------|-------|----------|--------------|-------|
+| Primary | `gpt-4.1-mini` | OpenAI | `OPENAI_MODEL` (`backend/config.py`) | Used by every logical role in §4.1. |
+| Temperature | `0` | — | `OPENAI_TEMPERATURE` (`backend/config.py`) | Deterministic. JSON-emitting prompts (date_extract, anomaly) rely on this. |
+| Fallback model | *none* | — | — | If the LLM is unreachable, every `llm_service.py` function falls back to a *deterministic* path (regex / plain-table / static summary), not to a second model. See ADR-4 in §3.5. |
+
+The legacy scripts at the repo root (`anomaly_processing_agent.py`,
+`anomaly_analyst.py`) contain commented-out `ChatOllama` configuration
+for a local Llama 3.1 model. **That code path is not active in the
+FastAPI backend** — no Ollama call happens on this branch.
+
+#### Cost / latency / quality trade-offs (informal)
+
+| Dimension | Today |
+|-----------|-------|
+| Cost | Mini-tier OpenAI pricing on every call. No token tracking yet (§22). |
+| Latency | Blocking `.invoke(prompt)` per call. Median end-to-end for `/api/analysis/setup` is dominated by the chunked `detect_anomalies` loop (one round-trip per 200-row chunk). |
+| Quality | Adequate for the task per spot-checks; not formally evaluated (§5.5). |
+
+#### Future
+
+- **Add a fallback model.** Today a 5xx from OpenAI degrades the
+  narrative to a regex / static fallback. A fallback to Anthropic
+  Claude or Bedrock Claude would preserve the LLM-quality narrative
+  during an OpenAI outage. PLANNED.
+- **Add a premium tier for Q&A.** Use `gpt-4.1` (or Claude Sonnet) for
+  `chat_about_anomalies` and `reconciliation_report` while keeping
+  `gpt-4.1-mini` for date extraction. PLANNED — see §5.2.
+- **Add an embedding model** (when RAG becomes applicable; see §9).
+  PLANNED.
+
+### 5.2 Routing Logic — *NA*
+
+**Why NA.** Every logical role in §4.1 calls the *same* `ChatOpenAI`
+instance. There is no per-task complexity heuristic, no per-user-tier
+routing, no fall-back-on-low-confidence policy. Routing is a property
+of a portfolio with more than one entry; the Anomaly Agent has one
+entry today.
+
+**Future conditions for this subsection becoming Applicable.**
+
+- A second model lands in §5.1 (premium tier or fallback). At that
+  point a routing rule per logical role is straightforward — extend
+  `get_llm` to accept a `role` argument and look it up in a small
+  dict. PLANNED.
+- A "model cascade" pattern (cheap-first, escalate on low confidence)
+  becomes desirable. Same hook point. PLANNED — §22.4.
+
+### 5.3 Provider Abstraction — *Applicable*
+
+**In code today.** The abstraction is **deliberately thin**: one
+function returning one client.
+
+```python
+# backend/llm_service.py
+def get_llm() -> ChatOpenAI:
+    global _llm
+    if _llm is None:
+        _llm = ChatOpenAI(model=OPENAI_MODEL, temperature=OPENAI_TEMPERATURE)
+    return _llm
+```
+
+```python
+# every public function uses the same envelope
+def invoke_llm(prompt: str) -> str:
+    try:
+        resp = get_llm().invoke(prompt)
+        return (resp.content or "").strip()
+    except Exception as exc:
+        log.exception("LLM invocation failed: %s", exc)
+        return ""
+```
+
+What this gives us today:
+
+| Property | Notes |
+|----------|-------|
+| Model swap via env | `OPENAI_MODEL=gpt-4o-mini python run_backend.py` works without code changes — anything `ChatOpenAI` accepts. |
+| Temperature swap via env | Same; `OPENAI_TEMPERATURE=0.4` if a creative role is added later. |
+| Vendor swap | Limited. `ChatOpenAI` is OpenAI-specific (LangChain class). Switching to Anthropic / Bedrock requires importing a sibling LangChain class and changing the construction line. |
+| Graceful failure | `invoke_llm` swallows every exception, logs with `log.exception`, and returns `""`. Each caller's deterministic fallback handles the empty string. |
+
+#### Future
+
+- **True multi-provider abstraction.** Replace the `ChatOpenAI`
+  reference with a `BaseChatModel` and select the concrete subclass
+  via env (`LLM_PROVIDER=openai|anthropic|bedrock|ollama`). LangChain
+  already exposes the parent class; the change is small but PLANNED.
+- **Native SDK option.** For prompt-caching (Anthropic) or batch
+  inference, switch directly to the `anthropic` / `openai` SDK instead
+  of LangChain. PLANNED.
+- **Streaming.** `invoke_llm` is blocking. Adding a `stream_llm`
+  variant that yields tokens belongs here. PLANNED — §14.2.
+
+### 5.4 Fine-Tuning & Adaptation — *NA*
+
+**Why NA.** No fine-tuning, LoRA, or model adaptation is performed for
+the Anomaly Agent. Every behavioural specialisation lives in:
+
+- The eight prompt files under `prompts/` (§6, §4.1).
+- The deterministic fallbacks in `backend/llm_service.py`.
+
+No training data is collected, no model artefacts are stored, no
+inference happens against a custom checkpoint.
+
+**Future conditions for this subsection becoming Applicable.**
+
+- The auditor feedback loop (PLANNED, §19.4) starts collecting
+  thumbs-up/thumbs-down labels on individual anomalies. With enough
+  labels, supervised fine-tuning of the anomaly detector role becomes
+  worth considering. PLANNED.
+- A domain-specific embedding model is needed for RAG (§9). PLANNED.
+
+### 5.5 Evaluation & Swap Criteria — *NA*
+
+**Why NA.** There is no automated evaluation harness on this branch:
+
+- No golden-set fixtures.
+- No rubric-based grading.
+- No LLM-as-judge harness.
+- No regression suite that pins the output of any prompt.
+- No threshold for "model X has improved enough to swap in."
+
+The only check today is the spot-checking the developer does while
+running the app locally.
+
+**Future.** The eval surface that should exist before any model swap is
+attempted is described in §20.2:
+
+- A `tests/eval/` fixture set: hand-curated `(input, expected)` pairs
+  for each logical role in §4.1.
+- A nightly LLM-as-judge run that scores responses against the rubric
+  in each prompt's required-headings contract (anomaly_format_prompt:
+  4 headings; reconciliation_prompt: 5 headings).
+- Swap criteria: a candidate model must (a) match or beat the current
+  model on the rubric, (b) be cheaper or comparable per call, (c)
+  preserve the JSON-emitting roles' parse rate (date_extract,
+  anomaly_prompt). PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-5 and beyond will be added in subsequent commits.*
+6 and beyond will be added in subsequent commits.*
