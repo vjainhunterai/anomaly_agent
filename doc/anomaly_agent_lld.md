@@ -1313,5 +1313,182 @@ exposed as function-calling tools to the LLM (§7.1 future). PLANNED.
 
 ---
 
+## 8. Memory Architecture
+
+### 8.1 Memory Types — *Applicable*
+
+**In code today.**
+
+| Memory type | Where it lives | Lifetime | Notes |
+|-------------|----------------|----------|-------|
+| Short-term (single LLM call) | The prompt itself — placeholders are filled at call time. | One round-trip. | No accumulation across calls. |
+| Session-scoped chat history | `Session.history: list[ChatTurn]` in `backend/session_manager.py` | Lifetime of the FastAPI process. | Used for display in the chat panel; NOT replayed back into prompts (the FSM-driven prompts re-build their own context every turn). |
+| Session-scoped analysis cache | `Session.analysis: dict` (rows, column_info, understanding, anomalies, final_output) | Lifetime of the FastAPI process. | Reused by `/api/analysis/ask`, `/api/reports/reconciliation` to avoid re-running the LLM pipeline. |
+| Session-scoped audit | `Session.audit: list[dict]` | Lifetime of the FastAPI process. | Surface: `/api/reports/audit`. |
+| Long-term / episodic / semantic | *(none)* | — | The legacy script `anomaly_analyst.py` references a `memory.json` file but the FastAPI backend does not read or write it. |
+
+**Future.**
+
+- **Long-term memory.** Persist `Session.analysis` and confirmed
+  anomalies to a `memory` table; feed previously confirmed anomalies
+  into `prompts/anomaly_prompt.txt` via the `{memory}` placeholder
+  (currently bound to the literal string `"[]"`). PLANNED — roadmap
+  Phase 1.
+- **Episodic memory.** Per-auditor history of accepted / rejected
+  anomalies for personalisation. PLANNED — depends on §16 (auth).
+- **Semantic memory.** Vector-indexed natural-language notes that the
+  auditor types into the analyst panel. PLANNED — depends on §9 (RAG).
+
+### 8.2 Write Path — *Applicable*
+
+**In code today.**
+
+| Trigger | Writer | Stored as |
+|---------|--------|-----------|
+| Every chat turn | `Session.add_turn(role, content)` | `Session.history` |
+| Every FSM transition / metadata write / airflow trigger | `Session.log(event, detail)` | `Session.audit` |
+| `/api/analysis/setup` | `analysis_setup` route | `Session.analysis` (dict) |
+| New `Session` | `SessionStore.create()` | `_sessions` dict, keyed by UUID |
+
+There is **no user consent flow** — the auditor's text is captured by
+the act of typing it. This is acceptable for an internal MVP but
+documented as a posture, not a guarantee. See §1.4 (single-tenant
+non-goal) and §16 future (auth).
+
+**Future.**
+
+- Persist all four write targets to a database (Postgres). PLANNED —
+  roadmap Phase 1.
+- Add an explicit "remember this" button so the auditor can pin a
+  specific anomaly into long-term memory. PLANNED — depends on §8.1
+  long-term memory.
+
+### 8.3 Read Path — *Partial / mostly Applicable*
+
+**In code today.**
+
+- **Display read.** `Session.history` is rendered in the chat panel.
+- **Reuse read.** `Session.analysis` is consumed by `analysis_ask` and
+  `reports_reconciliation` to avoid re-running the LLM pipeline.
+- **Audit read.** `Session.audit` is concatenated across all sessions
+  by `SessionStore.all_audit()` and exposed at `/api/reports/audit`.
+- **Prompt-time read.** The `{memory}` placeholder in
+  `prompts/anomaly_prompt.txt` is bound to the literal string `"[]"`
+  in `detect_anomalies` — i.e. **the read path is stubbed**. The plumb
+  is in place; the backing store is not.
+
+**Future.**
+
+- Replace the stub with a real read: top-N most recent confirmed
+  anomalies, ranked by recency / severity. PLANNED.
+- Add a context-window budget so a long memory does not blow past the
+  model's input limit. PLANNED — §11.2 + §22.2.
+
+### 8.4 Forgetting & Expiry — *Partial*
+
+**In code today.**
+
+- All memory is **process-local**: a `uvicorn` restart wipes every
+  session and audit entry instantly. This is the closest the app gets
+  to a TTL.
+- There is no per-user delete endpoint, no cron-style expiry, and no
+  GDPR-style purge.
+
+**Future.**
+
+- TTL / sliding-window retention on persisted sessions. PLANNED.
+- User-initiated `DELETE /api/agent/session/{id}`. PLANNED.
+- Compliance-driven purge (right-to-be-forgotten). PLANNED — depends
+  on §16 (auth) and §24.4 (privacy).
+
+### 8.5 Privacy Boundaries — *Partial*
+
+**In code today.**
+
+- **Per-session isolation.** `Session` objects are keyed by random
+  UUID4 and only the holder of the UUID can read or advance them
+  (`SessionStore.require(session_id)` is called by every route that
+  takes a session id).
+- **Cross-session leakage.** The chat / analysis / status code paths
+  never read another session's `history` or `analysis`. The only
+  cross-session aggregator is `/api/reports/audit`, which is intended
+  to be admin-only (no auth today, see future).
+- **Single-tenant assumption.** All sessions share the same backend
+  database connection and the same MySQL credentials.
+
+**Future.**
+
+- Authenticated `/api/reports/audit` so an analyst cannot scrape
+  another analyst's events. PLANNED — §16.5.
+- Tenant column in any future `sessions` table. PLANNED.
+- Encrypted-at-rest fields (Fernet key already pinned in
+  `requirements.txt`) for sensitive analyst notes. PLANNED.
+
+---
+
+## 9. Retrieval-Augmented Generation (RAG)
+
+### 9.1 Corpus & Sources — *NA*
+
+**Why NA.** The Anomaly Agent has **no document corpus and no vector
+store**. Every prompt is grounded by inline injection of structured
+context (column metadata + sampled rows + previously detected
+anomalies), not by retrieval from an indexed document set.
+
+**Future conditions for this subsection becoming Applicable.**
+
+- Auditor playbooks, vendor contracts, or SOX policy notes are loaded
+  into the system as searchable corpora that the analyst chat can
+  cite. PLANNED.
+
+### 9.2 Ingestion Pipeline — *NA*
+
+**Why NA.** No ingestion pipeline exists because there is no corpus
+(§9.1). The closest analogue is the SQL fetch path
+(`database.fetch_anomaly_data`), which is direct relational access —
+not parsing, chunking, or deduplicating documents.
+
+**Future.** PLANNED — depends on §9.1.
+
+### 9.3 Embedding Strategy — *NA*
+
+**Why NA.** No embedding model is loaded; `requirements.txt` does not
+pin one. There is no vector representation of anomalies, sessions,
+prompts, or column metadata.
+
+**Future.** PLANNED — depends on §9.1.
+
+### 9.4 Retrieval & Ranking — *NA*
+
+**Why NA.** Without an embedding model or a corpus, there is no
+retrieval surface. The "selection" of context for each prompt is
+hand-coded (e.g. "first 200 rows" in `understand_dataset`, "first 50
+rows" for `status_qa`); this is sampling, not retrieval.
+
+**Future.** PLANNED — depends on §9.1.
+
+### 9.5 Context Assembly — *NA*
+
+**Why NA.** Context is assembled by `str.format` substitution into a
+prompt template (§6.2). There is no token-budget aware packing, no
+citation formatting, no overflow handling.
+
+**Future conditions for this subsection becoming Applicable.**
+
+- Token-aware context packing once any prompt approaches the model's
+  input limit. Today the largest single call is the chunked anomaly
+  detector at 200 rows of JSON, which is well under any modern
+  context window. PLANNED — §11.2 + §22.2.
+
+### 9.6 Evaluation — *NA*
+
+**Why NA.** Recall@k, faithfulness, answer relevance, and groundedness
+metrics all presuppose a retrieval step (§9.4). With no retrieval, the
+metrics do not apply.
+
+**Future.** PLANNED — depends on §9.1 + §20.2 (LLM evaluation).
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-8 and beyond will be added in subsequent commits.*
+10 and beyond will be added in subsequent commits.*
