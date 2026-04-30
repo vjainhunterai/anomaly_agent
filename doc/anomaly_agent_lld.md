@@ -1044,5 +1044,274 @@ attempted is described in §20.2:
 
 ---
 
+# Part III — Behavior & Knowledge
+
+## 6. Prompt Engineering & System Prompts
+
+### 6.1 System Prompt Structure — *Applicable*
+
+**In code today.** The Anomaly Agent does not use a single global
+system prompt. Instead, each of the eight logical roles in §4.1 has its
+own prompt file under `prompts/`, and each follows the same
+canonical layout:
+
+1. **Role line.** Opens with *"You are ..."* establishing the persona
+   for that role (e.g. *"You are an anomaly detection engine for an
+   Accounts Payable duplicate invoice dataset."*).
+2. **Output contract.** What the LLM must emit (JSON shape, markdown
+   sections, length cap).
+3. **Rules block.** Numbered or bulleted list of hard constraints
+   ("Do NOT include commentary", "Use ONLY columns from the metadata",
+   "JSON ARRAY only, no fences").
+4. **Context placeholders.** `str.format` placeholders such as
+   `{column_info}`, `{understanding}`, `{anomalies}`.
+5. **Footer marker.** Trailing label such as `JSON:` or `ANSWER:` to
+   nudge the model into the expected output mode.
+
+Example skeleton (`prompts/anomaly_chat_prompt.txt`):
+
+```
+You are the Anomaly Agent's analyst chatbot. ...
+
+Answer using ONLY the context below. ...
+
+Style:
+- Direct, 2–6 sentences.
+- Cite specific invoice_id values when relevant.
+- ...
+
+COLUMN METADATA: {column_info}
+DATASET UNDERSTANDING: {understanding}
+DETECTED ANOMALIES (JSON): {anomalies}
+USER QUESTION: {question}
+
+ANSWER:
+```
+
+**Future.**
+
+- Promote shared rules ("never invent fields", "no emoji in LLM
+  output") into a tiny shared header that every prompt prepends, so
+  edits stay DRY. PLANNED.
+- Add an explicit `<persona>`, `<rules>`, `<context>`, `<task>` XML
+  scaffold (Anthropic-style) for prompts that move to Claude when §5.1
+  expands. PLANNED.
+
+### 6.2 Prompt Templates & Variables — *Applicable*
+
+**In code today.** Prompts are loaded from disk on first use and cached
+in process memory:
+
+```python
+# backend/llm_service.py
+_prompt_cache: dict[str, str] = {}
+
+def load_prompt(name: str) -> str:
+    if name not in _prompt_cache:
+        path: Path = PROMPTS_DIR / f"{name}.txt"
+        _prompt_cache[name] = path.read_text(encoding="utf-8")
+    return _prompt_cache[name]
+```
+
+Variables are injected with `str.format(**kwargs)`. Literal `{` / `}`
+characters must be doubled (`{{` / `}}`). Today only
+`prompts/date_extract_prompt.txt` exercises this — it includes a JSON
+skeleton `{{"start_date": "...", "end_date": "..."}}`.
+
+| Prompt file | Required placeholders |
+|-------------|------------------------|
+| `date_extract_prompt.txt` | `{input}` |
+| `understanding_prompt.txt` | `{column_info}`, `{data}` |
+| `anomaly_prompt.txt` | `{column_info}`, `{understanding}`, `{memory}`, `{data}` |
+| `anomaly_format_prompt.txt` | `{anomalies}` |
+| `anomaly_chat_prompt.txt` | `{column_info}`, `{understanding}`, `{anomalies}`, `{question}` |
+| `status_prompt.txt` | `{summary}`, `{rows}`, `{question}` |
+| `sql_prompt.txt` | `{column_info}`, `{question}`, `{table}` |
+| `reconciliation_prompt.txt` | `{start_date}`, `{end_date}`, `{summary}`, `{anomalies}` |
+
+A missing placeholder raises `KeyError` at runtime — there is no
+template-time validation today.
+
+**Future.**
+
+- Schema-validated templates (e.g. Pydantic dataclass per prompt with
+  the variable signature) so a `KeyError` becomes a startup failure
+  rather than a runtime crash. PLANNED.
+- Per-environment prompt overrides via `prompts/<env>/...`. PLANNED.
+
+### 6.3 Few-Shot Example Library — *NA*
+
+**Why NA.** None of the eight prompts include few-shot examples today.
+Each prompt is zero-shot: it states the role, the contract, the rules,
+and the placeholders, then asks for output. The required-headings
+contract in `anomaly_format_prompt.txt` and `reconciliation_prompt.txt`
+serves as the structural skeleton in lieu of examples.
+
+**Future conditions for this subsection becoming Applicable.**
+
+- The eval harness in §20.2 produces a curated golden set; the best
+  fixtures are promoted into the prompts as few-shot examples.
+  PLANNED.
+- A token-budget cap (§22.2) forces compression of the rules block
+  into examples instead of prose. PLANNED.
+
+### 6.4 Prompt Versioning — *NA*
+
+**Why NA.** Prompts are checked into git with no per-prompt version
+tag, no metadata header, and no A/B routing. The git history of
+`prompts/*.txt` is the only source of "what changed when". There is no
+runtime mechanism to roll back to an older prompt without a code
+deploy.
+
+**Future conditions for this subsection becoming Applicable.**
+
+- A `prompts/<name>.v<N>.txt` naming convention with an env-selectable
+  default. PLANNED.
+- A small `prompt_versions` table that records `(prompt_name, version,
+  hash, deployed_at)` so a regression can be tied back to a specific
+  prompt change. PLANNED — §21.2.
+- Prompt A/B testing tied to a feature-flag layer (§15.4). PLANNED.
+
+### 6.5 Anti-Patterns — *Applicable*
+
+**In code today.** The prompts deliberately avoid known-bad patterns,
+and the wrapper code defends against the rest.
+
+| Anti-pattern | How the codebase avoids it |
+|--------------|----------------------------|
+| Negation overload ("don't do X, don't do Y, never Z, don't W ..."). | Each prompt's "Rules:" block is short — typically 4–6 lines. |
+| Conflicting rules. | Required headings (anomaly_format_prompt: 4; reconciliation_prompt: 5) are stated once each. |
+| Hidden instructions in user content. | User free-text from the chat panel is never templated as instructions; it is always the value of `{input}`, `{question}`, etc. There is no concatenation of system + user instructions in the same string slot. |
+| JSON-with-prose output. | Date extraction and anomaly detection prompts say "JSON only" and the wrapper strips ```json fences with `_strip_json_fences`. |
+| Hallucinated columns. | Every prompt that references the data passes the real column metadata explicitly (`{column_info}`); the rules block forbids inventing columns. |
+| Destructive SQL via Q&A. | `sql_prompt.txt` instructs the model to add `LIMIT 200` and to never use INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE; `database.run_select_safely` re-checks at runtime. |
+| Free-form output where structure is needed. | The format / reconciliation prompts pin the heading set; the chat prompt pins sentence count. |
+| Empty / null replies passed to the renderer. | `invoke_llm` returns `""` on failure; each caller's deterministic fallback supplies a non-empty string. |
+
+**Future.**
+
+- A static lint pass over `prompts/*.txt` that detects negation overload
+  (e.g. > 6 "don't" / "never" lines). PLANNED.
+- A runtime check that the LLM output contains all the required
+  headings before rendering — see §2.2 future. PLANNED.
+
+---
+
+## 7. Tool Use & Function Calling
+
+### 7.1 Tool Catalog — *Applicable (loose interpretation)*
+
+**Section orientation.** The Anomaly Agent does not use OpenAI / Claude
+function-calling today — every prompt returns plain JSON or markdown,
+and the backend dispatches actions deterministically based on FSM
+state. What the LLD template calls "tools" therefore maps to **the set
+of side-effecting backend operations** the FSM may invoke on the user's
+behalf.
+
+**In code today.**
+
+| Tool | Caller | Side effect | Cost / latency | Owner |
+|------|--------|-------------|----------------|-------|
+| `upsert_anomaly_metadata(start_date, end_date)` | `_trigger_pipeline` | Truncates and re-inserts a single row in `anomaly_metadata`. | One round-trip to MySQL. | `backend/database.py` |
+| `trigger_airflow_dag(run_id)` | `_trigger_pipeline` | Opens an SSH connection to the EC2 host and runs `AIRFLOW_CMD --run-id <id>`. | Tens of seconds (network + Airflow CLI startup). | `backend/airflow_trigger.py` |
+| `fetch_anomaly_data()` | `analysis_setup` | Reads the full `anomaly.duplicate_ap_invoice` table. | Bounded by row count. | `backend/database.py` |
+| `fetch_column_metadata(table_name)` | `analysis_setup` | Reads `table_column_info` for column comments. | One small query. | `backend/database.py` |
+| `fetch_anomaly_summary()` | `/api/status/summary`, `/api/status/ask` | Counts rows in `anomaly.duplicate_ap_invoice`. | One small query. | `backend/database.py` |
+| `fetch_anomaly_rows(limit)` | `/api/status/contracts`, `/api/status/ask` | Reads up to `limit` rows. | One bounded query. | `backend/database.py` |
+| `run_select_safely(sql)` | `analysis_ask` (opportunistic) | Executes an LLM-generated `SELECT`. Refuses non-SELECT. | One query. | `backend/database.py` |
+
+Each "tool" has exactly one call site; there is no LLM-driven dispatch
+table.
+
+**Future.**
+
+- Promote these to true OpenAI / Claude function-calling tools so a
+  more autonomous agent loop (§10.1) can pick which to invoke based on
+  the user's question. PLANNED.
+- Add a `notify_user(channel, message)` tool for completion alerts.
+  PLANNED — §1.2.
+
+### 7.2 Tool Schema Conventions — *Applicable*
+
+**In code today.** Schemas are defined twice:
+
+- **Backend.** Pydantic 2 request / response models in
+  `backend/main.py` (e.g. `ChatRequest`, `AnalysisSetupResponse`,
+  `StatusSummary`). These are auto-published as JSON Schema at
+  `/openapi.json` and rendered by FastAPI's `/docs` page.
+- **Frontend.** Plain JavaScript in `frontend/src/services/api.js` —
+  no codegen, no shared type package. The frontend trusts the backend
+  to return what its OpenAPI spec promises.
+
+| Convention | How it is honoured |
+|------------|---------------------|
+| Naming | `snake_case` for fields, `kebab/lowercase` for routes (`/api/agent/start`). |
+| Parameter design | Path: never; Query: rare (`limit` on `/api/status/contracts`); Body: JSON for every POST. |
+| Error shape | `{"detail": "..."}` (FastAPI default). The frontend wrapper raises a JS `Error` whose `.message` is `detail`. |
+| Idempotency | Most reads are idempotent; `/api/agent/start` is **not** (creates a new session every call); `/api/agent/chat` is **not** (advances FSM). Documented in `doc/api-reference.md`. |
+
+**Future.**
+
+- TypeScript codegen from the OpenAPI spec into a shared client
+  package. PLANNED — §15.2.
+- Idempotency keys on the side-effecting routes
+  (`/api/agent/start`, `_trigger_pipeline`). PLANNED.
+
+### 7.3 Tool Selection Heuristics — *NA*
+
+**Why NA.** The Anomaly Agent does not let the LLM decide which tool to
+call. Tool selection is determined by:
+
+- The FSM step (`STEP_AWAIT_DATES` → date extractor, then validate;
+  `STEP_CONFIRM` → metadata write + Airflow trigger).
+- The HTTP route (`POST /api/analysis/setup` → fetch + understanding +
+  detect + format).
+
+There is no autonomy and therefore no heuristic to document.
+
+**Future.** A heuristic becomes meaningful only after the tools are
+exposed as function-calling tools to the LLM (§7.1 future). PLANNED.
+
+### 7.4 Parallel vs. Sequential Execution — *Applicable*
+
+**In code today. All sequential.**
+
+- Within `/api/analysis/setup`: `fetch → understand → detect → format`
+  are awaited in series.
+- Within `detect_anomalies`: chunks are processed in source order.
+- Within `/api/analysis/ask`: natural-language answer first, *then* the
+  optional SQL leg — never in parallel.
+
+**Future.**
+
+- Parallelise anomaly chunks (§4.5). PLANNED.
+- Run `chat_about_anomalies` and `generate_sql` concurrently in
+  `analysis_ask`. PLANNED.
+- Pre-fetch `fetch_anomaly_data` and `fetch_column_metadata`
+  concurrently in `setup`. PLANNED.
+
+### 7.5 Tool Failure Handling — *Applicable*
+
+**In code today.**
+
+| Tool | Failure surface | Behaviour |
+|------|-----------------|-----------|
+| `upsert_anomaly_metadata` | DB unreachable | `_trigger_pipeline` catches, sets FSM step to `error`, surfaces the exception to the user. |
+| `trigger_airflow_dag` | SSH timeout / auth error / non-zero exit | Returns `TriggerResult(ok=False, stderr=...)`. Assistant echoes `stderr` in a fenced block and instructs the user to reply `retry`. Audit event recorded. |
+| `fetch_*` (DB reads) | Most variants log a warning and return `[]` / `0` so the page does not crash. | `fetch_anomaly_summary`, `fetch_anomaly_rows`, `fetch_current_metadata_range` all wrap in `try/except`. |
+| `run_select_safely` | Non-SELECT or destructive verb | Raises `ValueError`; `analysis_ask` catches and continues (the natural-language answer still renders). |
+| LLM call | Any exception | `invoke_llm` swallows, logs, returns `""`. Each caller's deterministic fallback supplies a non-empty string. |
+
+**Future.**
+
+- Retries with exponential backoff on `trigger_airflow_dag`. Today it
+  is one attempt. PLANNED — §26.5.
+- Circuit-breaker around the SSH host so a hung host doesn't block
+  every chat. PLANNED.
+- User-visible toast on tool failure (today the failure is folded into
+  the next assistant message). PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-6 and beyond will be added in subsequent commits.*
+8 and beyond will be added in subsequent commits.*
