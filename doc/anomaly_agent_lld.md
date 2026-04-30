@@ -3264,5 +3264,255 @@ on exec — those are the only protections).
 
 ---
 
-*Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-27-28 will be added in the final commit.*
+# Part VII — Evolution
+
+## 27. Versioning & Roadmap
+
+### 27.1 Versioning Scheme — *Partial*
+
+**In code today.**
+
+| Subject | Versioning |
+|---------|------------|
+| App version | `frontend/package.json` carries `"version": "1.0.0"`. The backend has no equivalent — version is implicit in the git commit. |
+| API version | None (§23.2). |
+| Model version | Declared by env (`OPENAI_MODEL=gpt-4.1-mini`). |
+| Prompt version | Implicit in git history of `prompts/*.txt` (§6.4). |
+| Config version | Implicit in git history of `.env.example`. |
+
+There is no `__version__` constant in the backend, no
+`X-Anomaly-Version` response header, and no compatibility matrix.
+
+**Future.**
+
+- SemVer for the app: bump in `package.json` and a new
+  `backend/__init__.py::__version__` together; surface both at
+  `/api/health`. PLANNED.
+- SemVer for the API once external consumers exist (§23.2 future).
+  PLANNED.
+- Per-prompt version tag (§6.4 future). PLANNED.
+
+### 27.2 Change Management — *NA*
+
+**Why NA.** No RFC process, no Architecture Decision Record (ADR)
+template, no deprecation timeline policy. The seven ADRs in §3.5 are
+prose summaries embedded in this document, not separate ADR files
+under a directory.
+
+**Future.**
+
+- Adopt a lightweight ADR template at `doc/adr/NNNN-<slug>.md`. PLANNED.
+- An RFC process for any change that crosses two of the LLD parts
+  (e.g. *Streaming + Persistence* would require an RFC). PLANNED.
+- Deprecation policy once §23.2 future lands. PLANNED.
+
+### 27.3 Short-Term Roadmap (0–3 months) — *Applicable*
+
+**Source of truth.** `doc/roadmap.md` (Phases 0–2).
+
+**Phase 0 — Hardening (in flight).**
+
+- Most items shipped: pinned deps, `.env.example`, CORS lock-down,
+  read-only SQL guard, HTML escape in renderer.
+- Outstanding: scrub the hard-coded `OPENAI_API_KEY` from the legacy
+  `anomaly_processing_agent.py` and `anomaly_analyst.py`; rotate the
+  leaked key; add a `detect-secrets` pre-commit hook.
+
+**Phase 1 — Persistence.**
+
+- Postgres-backed `SessionStore`.
+- Persistent `audit_events` table behind `/api/reports/audit`.
+- `memory` table feeding the `{memory}` placeholder in
+  `prompts/anomaly_prompt.txt` (currently bound to `"[]"`).
+- Adopt Alembic.
+
+**Phase 2 — Real Airflow feedback.**
+
+- After-trigger polling of the Airflow REST API to surface SUCCESS /
+  FAILED on the chat panel and in `processing_state`.
+- Multi-row `anomaly_metadata` keyed by `run_id` so concurrent runs
+  do not race.
+- `tenacity` retry with backoff on the SSH trigger (§26.5 future).
+
+### 27.4 Medium-Term Roadmap (3–12 months) — *Applicable*
+
+**Source of truth.** `doc/roadmap.md` (Phases 3–6).
+
+- **Phase 3 — Push instead of poll.** SSE for status push; LangChain
+  streaming for token-level chat output (§14).
+- **Phase 4 — Multi-domain anomaly support.** Domain registry with
+  per-domain prompt directories; chat picks domain before date range
+  (§4.1 future).
+- **Phase 5 — Auth & multi-tenant.** OIDC against the corporate IdP;
+  `analyst` / `admin` roles; per-tenant scoping on every persisted
+  record; rate limiting (§16, §23.3).
+- **Phase 6 — Production deployment.** Dockerfile per service;
+  `docker-compose`; GitHub Actions CI; AWS Secrets Manager for prod
+  secrets; TLS termination; structured logs; OpenTelemetry export
+  (§21, §25, §26).
+
+These are directional bets, sized to a quarter each; the order is
+not strict, but Phase 1 unblocks most of Phase 2–4.
+
+### 27.5 Long-Term Vision (12+ months) — *Partial*
+
+**In code today.** Two long-term hypotheses are encoded in the
+codebase but not yet realised:
+
+- **Memory-backed detection becomes a moat.** The `{memory}`
+  placeholder is wired through `detect_anomalies` and
+  `prompts/anomaly_prompt.txt`. Once Phase 1 lands a backing store,
+  every subsequent run gets smarter at this customer's data — a
+  differentiator a generic AI assistant cannot replicate.
+- **Multi-domain runtime.** The architecture is generic
+  (FSM + chunked LLM + safe SQL + reconciliation). Adding a new
+  anomaly domain is a prompt-set + table-config change, not a
+  rewrite.
+
+**Future scenarios** (north stars; not commitments):
+
+- **Auditor co-pilot.** The agent watches the auditor's SQL ad-hoc
+  queries, suggests follow-ups, and pre-flags anomalies for the next
+  morning. Depends on §8 long-term memory + §11.4 future.
+- **Cross-product orchestration.** A single agent surface that fronts
+  AdminFee Agent + Anomaly Agent + future siblings, routing each
+  question to the right specialist. Depends on §4 future + §5
+  routing.
+- **Continuous detection.** The pipeline runs nightly on yesterday's
+  delta; the analyst's morning queue is pre-populated. Depends on
+  §13.5 future + §1.4 (reverses today's "real-time" non-goal).
+
+PLANNED.
+
+---
+
+## 28. Reference Appendix
+
+### 28.1 Glossary — *Applicable*
+
+| Term | Definition (in this app's sense) |
+|------|----------------------------------|
+| **Agent** | The single FastAPI session that owns the FSM, audit log, and analysis cache. There is one agent in §4.1 sense. |
+| **Logical role** | One of the eight `(prompt file, llm_service.py function)` pairs invoked by the single agent (§4.1). |
+| **Anomaly** | A record returned by the LLM in the JSON array shape `{invoice_id, anomaly_type, severity, reason, evidence}` (`prompts/anomaly_prompt.txt`). |
+| **Run** | One pipeline invocation: metadata write + Airflow trigger + downstream analysis, identified by `run_id` (`anomaly_<UTC timestamp>`). |
+| **Delivery** | A run as exposed to the analyst panel; identified by `delivery_id`. Today, derived from the latest `anomaly_metadata` row + the latest in-memory session. |
+| **Session** | An in-memory `Session` keyed by UUID4 in `SessionStore`. |
+| **FSM step** | One of `greet`, `await_dates`, `confirm`, `processing`, `done`, `error` (§10.3). |
+| **Metadata table** | `anomaly_metadata`, the single-row MySQL table the chat populates with the requested date range. |
+| **Source table** | `anomaly.duplicate_ap_invoice`, the table that anomaly detection reads. |
+| **Column metadata** | Output of `database.fetch_column_metadata`, derived from `table_column_info`. Provides the column descriptions the LLM grounds its output on. |
+| **Reconciliation** | The structured markdown summary at `/api/reports/reconciliation` (`prompts/reconciliation_prompt.txt`). |
+| **Audit event** | A record appended to `Session.audit` via `Session.log(event, detail)`. |
+| **Read-only SQL guard** | `database.run_select_safely`, the runtime check that LLM-generated SQL is a `SELECT` and contains no destructive verbs. |
+| **Deterministic fallback** | The non-LLM code path each `llm_service.py` function returns when `invoke_llm` fails (regex / static / plain-table). See ADR-4. |
+| **AdminFee Agent** | The sister product whose architecture this app mirrors verbatim (§2.4). |
+
+**Future.**
+
+- Promote the glossary to its own file (`doc/glossary.md`) once any
+  term collides with a sister-product term. PLANNED.
+
+### 28.2 Architecture Decision Records (ADRs) — *Partial*
+
+**In code today.** Seven ADRs are documented inline in §3.5 of this
+LLD. They are prose summaries, not standalone files. Status of each:
+
+| # | Title | Status |
+|---|-------|--------|
+| ADR-1 | Hand-rolled FSM in Python, not LangGraph | Accepted |
+| ADR-2 | Polling, not push, for status | Accepted |
+| ADR-3 | In-memory session store | Accepted (will be superseded by Phase 1) |
+| ADR-4 | Regex / deterministic fallback for every LLM call | Accepted |
+| ADR-5 | Read-only SQL execution path for analyst Q&A | Accepted |
+| ADR-6 | No third-party UI library | Accepted |
+| ADR-7 | No auth / no multi-tenant on this branch | Accepted (will be superseded by Phase 5) |
+
+**Future.**
+
+- Move each ADR to `doc/adr/000N-<slug>.md` with a header
+  (`Status: Accepted | Superseded by ADR-NN | Deprecated`) and a
+  date. PLANNED.
+- Future ADRs queued (ADR-8 Persistent session backend, ADR-9 Airflow
+  REST polling, ADR-10 LLM streaming, ADR-11 Multi-domain support,
+  ADR-12 Auth + RBAC). PLANNED — §3.5 future.
+
+### 28.3 External References — *Partial*
+
+**In code today.** The repo cites external work informally:
+
+- **FastAPI documentation** for routing / Pydantic patterns —
+  `backend/main.py`.
+- **LangChain-OpenAI** for the `ChatOpenAI` wrapper — `backend/llm_service.py`.
+- **SQLAlchemy 2.0 docs** for the `text()` + `mappings()` pattern —
+  `backend/database.py`.
+- **Paramiko documentation** for SSH connection / exec — `backend/airflow_trigger.py`.
+- **AdminFee Agent codebase** as the architectural reference (§2.4,
+  §3.5 ADR-1).
+
+There is no central references file.
+
+**Future.** A `doc/references.md` with per-area links (FastAPI,
+SQLAlchemy 2 migration guide, OpenAI prompt caching, Anthropic
+prompt-engineering guide). PLANNED.
+
+### 28.4 Diagrams Index — *Partial*
+
+**In code today.** One diagram, embedded as ASCII art in §3.1. No
+`*.drawio` source, no PlantUML, no Mermaid file.
+
+**Future.**
+
+- A `doc/diagrams/` folder with one Mermaid file per concept
+  (architecture, FSM, request lifecycle). PLANNED.
+- The same diagrams rendered into the LLD via Mermaid blocks (which
+  GitHub renders natively in markdown). PLANNED.
+
+### 28.5 Document Revision History — *Applicable*
+
+**In code today.** Git is the canonical revision history of this LLD
+file. Each section landed in its own commit so the revision history
+is granular:
+
+| Section(s) | Commit prefix |
+|------------|---------------|
+| §1 | `Add LLD §1 in markdown (Applicable / NA scheme)` |
+| §2 | `Add LLD §2 in markdown: Agent Identity, Persona & Voice` |
+| §3 | `Add LLD §3 in markdown: System Architecture Overview` |
+| §4 | `Add LLD §4 in markdown: Multi-Agent Topology & Roles` |
+| §5 | `Add LLD §5 in markdown: LLM Strategy & Model Selection` |
+| §6–§7 | `Add LLD §6-§7 in markdown: Prompt Engineering + Tool Use` |
+| §8–§9 | `Add LLD §8-§9: Memory + RAG (RAG entirely NA)` |
+| §10–§11 | `Add LLD §10-§11: Orchestration + Conversation State` |
+| §12–§13 | `Add LLD §12-§13: Frontend Architecture + Backend Services` |
+| §14–§16 | `Add LLD §14-§16: Streaming + Integration + Auth (mostly NA)` |
+| §17–§18 | `Add LLD §17-§18: Guardrails + Threat Modeling` |
+| §19–§20 | `Add LLD §19-§20: UX + Testing Strategy` |
+| §21–§22 | `Add LLD §21-§22: Observability + Cost Management` |
+| §23–§24 | `Add LLD §23-§24: API Design + Data Architecture` |
+| §25–§26 | `Add LLD §25-§26: Deployment + Reliability` |
+| §27–§28 | `Add LLD §27-§28: Versioning + Reference Appendix` |
+
+Run `git log --oneline -- doc/anomaly_agent_lld.md` for the full
+machine-generated history with hashes.
+
+**Future.**
+
+- A surfaced `## Changelog` block at the bottom of this file once the
+  LLD has stabilised, summarising material changes per release.
+  PLANNED.
+
+---
+
+## End of LLD
+
+This document fills in every section of `doc/lld.md` for the Anomaly
+Agent on branch `claude/anomaly-agent-frontend-s9ygV`. Each subsection
+is labelled *Applicable* (with **in code today** vs **future**
+content) or **NA** (with a one-paragraph justification). Source-of-
+truth references for each claim live in the cited file paths under
+`backend/`, `frontend/`, `prompts/`, and the supporting docs in
+`doc/`.
+
+For the forward-looking summary, see `doc/roadmap.md` (the phased
+plan) and §27.3–§27.5 above.
