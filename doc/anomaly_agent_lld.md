@@ -2879,5 +2879,196 @@ itself.
 
 ---
 
+## 23. API Design & Contracts
+
+### 23.1 API Style & Conventions — *Applicable*
+
+**In code today.**
+
+| Convention | Choice |
+|------------|--------|
+| Style | REST under `/api/*`, JSON in / JSON out. |
+| Naming | `snake_case` for fields; lowercase / hyphenated paths (`/api/agent/start`). |
+| Verbs | `POST` for any state change (start, chat, setup, ask, reconciliation); `GET` for reads. |
+| Path style | Resource grouping by domain: `agent`, `status`, `analysis`, `reports`, `health`. |
+| Pagination | Single `limit` query param on `/api/status/contracts`; no cursor / offset. |
+| Filtering | Not exposed today; the panels render whatever the route returns. |
+| Error shape | FastAPI default: `{"detail": "..."}`, status codes `400` / `404` / `500`. |
+| Datetime format | ISO 8601 strings (`2026-04-30T10:31:55.123Z`) — produced by `datetime.utcnow().isoformat() + "Z"`. |
+
+Full request / response detail lives in `doc/api-reference.md`; the
+canonical machine-readable contract is at `/openapi.json`.
+
+**Future.**
+
+- Cursor-based pagination on `/api/reports/audit` once it persists.
+  PLANNED.
+- Server-side filtering on `/api/status/contracts` (`?status=flagged`,
+  `?vendor=...`). PLANNED.
+
+### 23.2 Versioning — *NA*
+
+**Why NA.** No URI versioning (`/api/v1/...`), no header versioning
+(`Accept: application/vnd.anomaly.v1+json`), no media-type
+versioning. There is exactly one version: whatever is on `HEAD` of the
+branch. The frontend ships with the backend and they move together.
+
+**Future.**
+
+- Adopt URI versioning when an external consumer (BI tool, partner)
+  appears. The pattern: route every existing path under `/api/v1/`
+  in one PR. PLANNED.
+- Deprecation policy: announce in the changelog (§27.2 future), keep
+  the old version for one minor release, log on usage. PLANNED.
+
+### 23.3 Rate Limiting & Quotas — *NA*
+
+**Why NA.** No per-user, per-IP, or per-key rate limit. No token
+bucket, no `429` response path. The OpenAI quota is the only de-facto
+limit, and a single client can blow through it.
+
+**Future.**
+
+- `slowapi` middleware for per-IP / per-session rate limits. PLANNED.
+- Burst vs sustained: 5 req/s burst, 60 req/min sustained on
+  `/api/agent/chat`; 1/min on `/api/analysis/setup`. PLANNED.
+- 429 with `Retry-After` header. PLANNED.
+
+### 23.4 SDK & Client Libraries — *NA*
+
+**Why NA.** No Python SDK, no JS SDK, no codegen client. The frontend
+`services/api.js` is a thin hand-written `fetch` wrapper used only by
+this app's own panels. There is no published artefact and no other
+consumer.
+
+**Future.**
+
+- Auto-generate a TypeScript client from `/openapi.json` (e.g.
+  `openapi-typescript-codegen`) and ship it as
+  `frontend/src/services/generated/`. PLANNED — §15.2 future.
+- A small Python client wrapper for ops scripts. PLANNED.
+
+### 23.5 Developer Experience — *Partial*
+
+**In code today.**
+
+- **Live Swagger UI.** FastAPI publishes `/docs` (Swagger) and
+  `/redoc` automatically — every backend dev has an interactive
+  playground without writing curl.
+- **OpenAPI spec.** `/openapi.json` is up to date by construction.
+- **Reload-on-edit.** uvicorn `--reload` watches `backend/` and
+  `prompts/`; Vite Fast Refresh covers the frontend.
+- **Markdown docs.** `doc/api-reference.md`, `doc/architecture.md`,
+  `doc/setup-windows.md`, `doc/feature-status.md`, `doc/prompts.md`,
+  `doc/roadmap.md`, plus this file.
+
+What is **not** done today:
+
+- No public docs site (everything is in the repo).
+- No interactive playground beyond Swagger.
+- No changelog file.
+
+**Future.**
+
+- A docs site published from `doc/` via MkDocs or Docusaurus.
+  PLANNED.
+- A `CHANGELOG.md` in the conventional commits style. PLANNED.
+
+---
+
+## 24. Data Architecture & Storage
+
+### 24.1 Data Stores — *Applicable (one store)*
+
+**In code today.** A single MySQL warehouse on AWS RDS. No OLAP
+cluster, no vector store, no object store, no cache layer.
+
+| Store | Schemas / Tables | Used by |
+|-------|------------------|---------|
+| MySQL on RDS (`joblog_metadata`) | `anomaly_metadata` (single-row range), `table_column_info` (column comments). | `database.upsert_anomaly_metadata`, `fetch_column_metadata`, `fetch_current_metadata_range`. |
+| MySQL on RDS (`anomaly`) | `duplicate_ap_invoice` (the source data). | `database.fetch_anomaly_data`, `fetch_anomaly_rows`, `fetch_anomaly_summary`, `run_select_safely`. |
+
+In-process state (not a "data store" in the LLD sense) lives in
+`SessionStore` (§8).
+
+**Future.**
+
+- A persistent OLTP for sessions / audit / memory (Postgres). PLANNED
+  — roadmap Phase 1.
+- An object store (S3) for raw invoice ingestion. PLANNED — `boto3`
+  pinned, not used.
+- A vector store once §9 (RAG) becomes Applicable. PLANNED.
+
+### 24.2 Schemas & Migrations — *Partial*
+
+**In code today.**
+
+- The Anomaly Agent **does not own** the schema for `duplicate_ap_invoice`
+  or `table_column_info`; those are produced by an upstream Airflow
+  pipeline that lives outside this repo.
+- The app **does write** to `anomaly_metadata` (truncate + insert).
+  The DDL for that table is assumed to exist; the app does not
+  create it.
+- There is **no migration tool** (Alembic, Yoyo) on this branch.
+
+**Future.**
+
+- Adopt Alembic for any tables this app owns once Phase 1 lands
+  (Postgres-backed sessions, audit, memory). PLANNED.
+- A small `db/migrations/` folder with a one-up / one-down style.
+  PLANNED.
+- Zero-downtime deployments via additive migrations only (no column
+  drops in the same release as the code change). PLANNED.
+
+### 24.3 Data Lifecycle — *Partial*
+
+**In code today.**
+
+| Stage | Today's behaviour |
+|-------|-------------------|
+| Ingestion | Out of scope for this app (handled upstream by the AdminFee data pipeline DAG). |
+| Enrichment | The chunked `detect_anomalies` step is the closest analogue: it produces an in-memory list of anomaly objects per run, never persisted. |
+| Retention | Source tables: not managed by this app. Anomaly results: **lost on backend restart**. |
+| Archival | NA today. |
+| Deletion | NA today. |
+
+**Future.**
+
+- Persist anomaly run results so the analyst can re-open last
+  Tuesday's run. PLANNED — roadmap Phase 1.
+- Retention policy: keep run results 12 months, audit events 7
+  years (typical SOX horizon). PLANNED.
+
+### 24.4 Privacy & Compliance — *NA*
+
+**Why NA.** No PII classification matrix, no encryption-at-rest plan
+beyond what the underlying RDS instance provides, no GDPR / CCPA /
+HIPAA posture. The app handles AP invoice data — vendor names,
+amounts, dates — which is commercially sensitive but not personally
+identifying in the typical sense.
+
+**Future.**
+
+- Classify each column in `anomaly.duplicate_ap_invoice` as
+  *commercial-sensitive* / *quasi-PII* / *non-sensitive*. PLANNED.
+- Encrypt analyst notes at rest using Fernet (already pinned).
+  PLANNED — §18.4 future.
+- Right-to-be-forgotten endpoint once §16 future lands. PLANNED.
+
+### 24.5 Analytics & Data Warehouse — *NA*
+
+**Why NA.** No event schema for product analytics, no ETL into a
+warehouse, no analyst-facing BI dashboard sourced from this app.
+
+**Future.**
+
+- Emit a `run_completed` event (run id, anomaly count, severity
+  histogram, latency) onto a small `app_events` table or an event
+  bus. PLANNED.
+- Pipe `app_events` into the company warehouse for cross-product
+  analytics. PLANNED.
+
+---
+
 *Last updated for branch `claude/anomaly-agent-frontend-s9ygV`. Sections
-23 and beyond will be added in subsequent commits.*
+25 and beyond will be added in subsequent commits.*
